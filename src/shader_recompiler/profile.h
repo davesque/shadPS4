@@ -52,6 +52,10 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+
+    // Member-wise comparison so pipeline-cache compatibility checks ignore struct
+    // padding (raw memcmp of the padded struct spuriously fails across runs).
+    bool operator==(const Profile&) const = default;
 };
 
 } // namespace Shader

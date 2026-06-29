@@ -313,7 +313,16 @@ void PipelineCache::WarmUp() {
                                            std::move(profile_data));
         return;
     }
-    if (std::memcmp(profile_data.data(), &profile, sizeof(profile)) != 0) {
+    // Compare field-wise (not raw bytes): the Profile struct has padding that is
+    // never zeroed, so memcmp spuriously fails between runs on the same system and
+    // the cache is discarded every time. Field-wise comparison ignores padding.
+    bool compatible = profile_data.size() == sizeof(profile);
+    if (compatible) {
+        Shader::Profile cached_profile{};
+        std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+        compatible = cached_profile == profile;
+    }
+    if (!compatible) {
         LOG_WARNING(Render,
                     "Pipeline cache isn't compatible with current system. Ignoring the cache");
         Storage::DataBase::Instance().Close();
