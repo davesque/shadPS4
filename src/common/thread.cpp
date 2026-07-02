@@ -20,6 +20,9 @@
 #elif defined(_WIN32)
 #include <windows.h>
 #include "common/string_util.h"
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 #else
 #if defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
 #include <pthread_np.h>
@@ -115,7 +118,17 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+    // Prefer a high-resolution waitable timer (Win10 1803+) for precise frame
+    // pacing. The default waitable timer is limited to the OS timer granularity
+    // and overshoots the target, which caps the emulated vblank below its rate
+    // (~58fps instead of a clean 60). Fall back to the coarse timer if
+    // unavailable.
+    HANDLE timer = ::CreateWaitableTimerExW(
+        NULL, NULL, CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+    if (timer == NULL) {
+        timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+    }
     SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
     const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
     ::CloseHandle(timer);
