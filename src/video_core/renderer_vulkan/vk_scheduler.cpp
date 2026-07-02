@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/present_log.h"
+#include "common/stutter_log.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -17,6 +20,7 @@ Scheduler::Scheduler(const Instance& instance)
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
+    InitGpuTiming();
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -123,12 +127,22 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::Wait(u64 tick) {
+    // Profiling: time the CPU-side stall waiting on the GPU.
+    const auto profile_t0 = std::chrono::steady_clock::now();
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
     work_semaphore.Wait(tick);
+    const double profile_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - profile_t0)
+            .count();
+    Common::StutterAdd(Common::StutterCat::GpuWait, profile_ms);
+    Common::PresentAddGpuWait(profile_ms);
+    if (profile_ms > 0.5) {
+        Common::ProfileLog("WAIT", profile_ms);
+    }
 }
 
 void Scheduler::PopPendingOperations() {
@@ -150,6 +164,9 @@ void Scheduler::BeginSession() {
     };
     session.primary = command_pool.Commit();
     Check(session.primary.begin(begin_info));
+
+    // Stamp the GPU-side start of this submission's work in its first session.
+    GpuTimingCmdStart();
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -198,6 +215,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         on_submit(info);
     }
 
+    // Stamp the GPU-side end of this submission's work, tagged with the tick that
+    // will signal once the GPU has finished it (so we know when to read back).
+    GpuTimingCmdEnd(signal_value);
+
     EndSession();
 
     std::vector<vk::CommandBuffer> cmd_buffers;
@@ -241,10 +262,88 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();
+
+    // Read back any GPU timestamp pairs the GPU has now finished.
+    GpuTimingReadback();
+
     BeginSession();
 
     // Apply pending operations
     PopPendingOperations();
+}
+
+void Scheduler::InitGpuTiming() {
+    // Reuse the present-log gate so GPU timing turns on exactly when we're
+    // diagnosing, with no separate env var.
+    gpu_timing_enabled = Common::PresentLogEnabled();
+    if (!gpu_timing_enabled) {
+        return;
+    }
+    const auto limits = instance.GetPhysicalDevice().getProperties().limits;
+    // timestampComputeAndGraphics guarantees the graphics queue supports timestamps
+    // with full valid bits; if absent, skip rather than risk garbage.
+    if (!limits.timestampComputeAndGraphics || limits.timestampPeriod <= 0.0f) {
+        gpu_timing_enabled = false;
+        return;
+    }
+    timestamp_period_ns = static_cast<double>(limits.timestampPeriod);
+    const vk::QueryPoolCreateInfo info = {
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = kTsPairs * 2,
+    };
+    auto [res, pool] = instance.GetDevice().createQueryPoolUnique(info);
+    if (res != vk::Result::eSuccess) {
+        gpu_timing_enabled = false;
+        return;
+    }
+    timestamp_pool = std::move(pool);
+    ts_tick.fill(0);
+}
+
+void Scheduler::GpuTimingCmdStart() {
+    if (!gpu_timing_enabled || ts_open) {
+        return;
+    }
+    ts_open = true;
+    const u32 base = ts_index * 2;
+    // Queries must be reset before being written. Resetting on the GPU timeline
+    // right before the write keeps it correctly ordered.
+    const auto cmdbuf = sessions.back().primary;
+    cmdbuf.resetQueryPool(*timestamp_pool, base, 2);
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *timestamp_pool, base);
+}
+
+void Scheduler::GpuTimingCmdEnd(u64 gpu_tick) {
+    if (!gpu_timing_enabled || !ts_open || sessions.empty()) {
+        return;
+    }
+    ts_open = false;
+    const u32 base = ts_index * 2;
+    sessions.back().primary.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *timestamp_pool,
+                                  base + 1);
+    ts_tick[ts_index] = gpu_tick;
+    ts_index = (ts_index + 1) % kTsPairs;
+}
+
+void Scheduler::GpuTimingReadback() {
+    if (!gpu_timing_enabled) {
+        return;
+    }
+    const u64 known = work_semaphore.KnownGpuTick();
+    for (u32 i = 0; i < kTsPairs; ++i) {
+        if (ts_tick[i] == 0 || ts_tick[i] > known) {
+            continue; // free slot, or GPU hasn't finished this pair yet
+        }
+        std::array<u64, 2> ts{};
+        const auto res = instance.GetDevice().getQueryPoolResults(
+            *timestamp_pool, i * 2, 2, sizeof(ts), ts.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        if (res == vk::Result::eSuccess && ts[1] > ts[0]) {
+            const double ms = static_cast<double>(ts[1] - ts[0]) * timestamp_period_ns / 1.0e6;
+            Common::PresentAddGpuBusy(ms);
+        }
+        ts_tick[i] = 0;
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

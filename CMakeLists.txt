@@ -831,6 +831,10 @@ set(COMMON src/common/logging/classes.cpp
            src/common/string_literal.h
            src/common/string_util.cpp
            src/common/string_util.h
+           src/common/stutter_log.cpp
+           src/common/stutter_log.h
+           src/common/present_log.cpp
+           src/common/present_log.h
            src/common/thread.cpp
            src/common/thread.h
            src/common/types.h
@@ -1263,7 +1267,9 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/big_picture/imgui_impl_sdlrenderer3.h
 )
 
-set(INPUT src/input/controller.cpp
+set(INPUT src/input/bench_input.cpp
+          src/input/bench_input.h
+          src/input/controller.cpp
           src/input/controller.h
           src/input/controller_state.cpp
           src/input/input_handler.cpp

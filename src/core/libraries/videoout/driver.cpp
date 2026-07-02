@@ -3,9 +3,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include "common/assert.h"
+#include "common/bench.h"
 #include "common/debug.h"
+#include "common/present_log.h"
+#include "common/stutter_log.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -86,8 +90,9 @@ static PresentPacing DeterminePresentPacing() {
 // vblank interval and nudge the timer toward mid-interval, the point farthest
 // from both boundaries. Bounded proportional steering (max 200us/tick, gain
 // 1/16) locks from a worst-case 8.3ms error in about a second and is immune to
-// an occasional bad DWM sample.
-static void PhaseLockStep(Common::AccurateTimer& timer) {
+// an occasional bad DWM sample. Returns the measured phase in ms, or a
+// negative value when no sample was available.
+static double PhaseLockStep(Common::AccurateTimer& timer) {
     static const s64 qpc_freq = []() {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
@@ -96,7 +101,7 @@ static void PhaseLockStep(Common::AccurateTimer& timer) {
     DWM_TIMING_INFO timing{};
     timing.cbSize = sizeof(timing);
     if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing)) || timing.qpcRefreshPeriod == 0) {
-        return;
+        return -1.0;
     }
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -109,6 +114,7 @@ static void PhaseLockStep(Common::AccurateTimer& timer) {
     constexpr s64 kMaxStepNs = 200'000;
     const s64 step = std::clamp(error_ns / 16, -kMaxStepNs, kMaxStepNs);
     timer.Adjust(std::chrono::nanoseconds(-step));
+    return static_cast<double>(phase) * 1000.0 / static_cast<double>(qpc_freq);
 }
 #endif
 
@@ -385,6 +391,9 @@ void VideoOutDriver::DrawLastFrame() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
+    // Guest's intended framerate: count every flip the game asks for, before host
+    // pacing. Compared against the host present rate in the present log.
+    Common::PresentCountSubmit();
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -449,12 +458,22 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    // vblank period as ms; the per-flip pacing target is this times (flip_rate+1).
+    const double base_target_ms = std::chrono::duration<double, std::milli>(vblank_period).count();
+
+    double phase_ms = -1.0;
     while (!token.stop_requested()) {
+        // Time how long the pacer actually sleeps, so the present-cost log can
+        // separate pacing (sleep/overshoot) from real work.
+        const auto pace_t0 = std::chrono::steady_clock::now();
         timer.Start();
+        const double sleep_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pace_t0)
+                .count();
 
 #ifdef _WIN32
         if (pacing.display_locked) {
-            PhaseLockStep(timer);
+            phase_ms = PhaseLockStep(timer);
         }
 #endif
 
@@ -477,8 +496,41 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
+                // CPU time spent inside Present() (acquire+record+flush+qpresent);
+                // the "work" the pacer has to fit inside the vblank budget.
+                const auto flip_t0 = std::chrono::steady_clock::now();
                 Flip(request);
+                const double work_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - flip_t0)
+                        .count();
                 FRAME_END;
+                {
+                    // Per-displayed-frame delta (ms). Computed unconditionally so the
+                    // live stutter telemetry (SHAD_STUTTER_LOG) works during NORMAL
+                    // play; the bench-only FLIP timeline + framelog stay gated by
+                    // benchmark mode. All sinks are env-gated internally (~free off).
+                    static auto last = std::chrono::steady_clock::now();
+                    const auto now = std::chrono::steady_clock::now();
+                    const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+                    last = now;
+                    Common::StutterFrame(ms);
+                    // Host present-rate + pacing breakdown (SHAD_PRESENT_LOG). The
+                    // per-flip target is one vblank times (flip_rate+1).
+                    Common::PresentFrame(ms, work_ms, sleep_ms,
+                                         base_target_ms * (main_port.flip_rate + 1), phase_ms);
+                    if (Common::IsBenchmarkMode()) {
+                        Common::ProfileLog("FLIP", ms);
+                        static std::FILE* bench_file = []() -> std::FILE* {
+                            const char* path = std::getenv("SHAD_FRAMELOG");
+                            return path ? std::fopen(path, "w") : nullptr;
+                        }();
+                        if (bench_file != nullptr) {
+                            std::fprintf(bench_file, "%.3f\n", ms);
+                            std::fflush(bench_file);
+                        }
+                    }
+                }
             }
         }
 
