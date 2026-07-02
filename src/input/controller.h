@@ -55,7 +55,6 @@ private:
     template <typename T>
     using AxisArray = std::array<T, std::to_underlying(Axis::AxisMax)>;
     static constexpr AxisArray<s32> axis_defaults{128, 128, 128, 128, 0, 0};
-    static constexpr u64 axis_smoothing_time{33000};
     AxisArray<bool> axis_smoothing_flags{true};
     AxisArray<u64> axis_smoothing_start_times{0};
     AxisArray<int> axis_smoothing_start_values{axis_defaults};

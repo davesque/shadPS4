@@ -3,6 +3,9 @@
 
 #include "input_handler.h"
 
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <list>
@@ -831,6 +834,54 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
                                     0, 128);
             }
         };
+        // Right-stick (camera) sensitivity + response curve, LIVE-tunable by editing
+        // the text file named by SHAD_CAM_TUNE_FILE (re-read every ~500ms while the
+        // camera moves, so edits apply without relaunching). File format, one per line:
+        //   sens=1.5     output multiplier (>1 = faster / reaches max with less push)
+        //   curve=1.0    response-curve exponent on |deflection| (1.0=linear, <1=snappier
+        //                near center, >1=finer near center)
+        // shadPS4 otherwise sends a flat linear value; this shapes the camera feel to
+        // match e.g. Elden Ring's default without patching the game. No-op at defaults.
+        auto ApplyCameraCurve = [](s16* value) {
+            static const std::string tune_file = []() -> std::string {
+                const char* p = std::getenv("SHAD_CAM_TUNE_FILE");
+                return (p != nullptr && *p != '\0') ? std::string(p) : std::string();
+            }();
+            // Baked-in defaults: user-converged Bloodborne camera feel matching Elden
+            // Ring's default (in-game BB camera sensitivity 9). Override live via the
+            // SHAD_CAM_TUNE_FILE if set.
+            static float sens = 1.55f;
+            static float curve = 1.1f;
+            static std::chrono::steady_clock::time_point last_read{};
+            if (!tune_file.empty()) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_read > std::chrono::milliseconds(500)) {
+                    last_read = now;
+                    std::ifstream f(tune_file);
+                    std::string line;
+                    while (std::getline(f, line)) {
+                        const auto eq = line.find('=');
+                        if (eq == std::string::npos) {
+                            continue;
+                        }
+                        const std::string key = line.substr(0, eq);
+                        const float v = static_cast<float>(std::atof(line.substr(eq + 1).c_str()));
+                        if (key == "sens" && v > 0.0f) {
+                            sens = v;
+                        } else if (key == "curve" && v >= 0.05f) {
+                            curve = v;
+                        }
+                    }
+                }
+            }
+            if (sens == 1.0f && curve == 1.0f) {
+                return;
+            }
+            const float sign = *value < 0 ? -1.0f : 1.0f;
+            float mag = std::min(std::abs(*value) / 128.0f, 1.0f);
+            mag = std::min(std::pow(mag, curve) * sens, 1.0f);
+            *value = static_cast<s16>(sign * mag * 128.0f);
+        };
         float multiplier = 1.0;
         Axis c_axis = GetAxisFromSDLAxis(axis);
         switch (c_axis) {
@@ -843,6 +894,7 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         case Axis::RightY:
             ApplyDeadzone(new_param, rightjoystick_deadzone[gamepad_index]);
             multiplier = rightjoystick_halfmode ? 0.5 : 1.0;
+            ApplyCameraCurve(new_param);
             break;
         case Axis::TriggerLeft:
             ApplyDeadzone(new_param, lefttrigger_deadzone[gamepad_index]);

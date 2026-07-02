@@ -1,13 +1,16 @@
 ﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <sstream>
 #include <unordered_set>
 #include <SDL3/SDL.h>
 #include <common/elf_info.h>
 #include <common/singleton.h>
+#include "common/bench.h"
 #include "common/logging/log.h"
 #include "controller.h"
+#include "input/bench_input.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/pad/pad.h"
@@ -74,17 +77,30 @@ void State::OnAccel(const float accel[3]) {
 }
 
 void State::UpdateAxisSmoothing() {
+    // Analog-stick smoothing duration in microseconds. shadPS4 eases each axis
+    // toward its target over this window, which adds latency + a mushy response
+    // curve to camera control. Tunable via SHAD_AXIS_SMOOTH_MS (milliseconds;
+    // 0 = disabled -> sticks snap instantly). Default 33ms (one 30fps frame).
+    static const u64 smoothing_time = []() -> u64 {
+        const char* e = std::getenv("SHAD_AXIS_SMOOTH_MS");
+        if (e != nullptr && *e != '\0') {
+            const long ms = std::atol(e);
+            return ms > 0 ? static_cast<u64>(ms) * 1000 : 0;
+        }
+        return 33000;
+    }();
     for (int i = 0; i < std::to_underlying(Axis::AxisMax); i++) {
-        // if it's not to be smoothed or close enough, just jump to the end
-        if (!axis_smoothing_flags[i] || std::abs(axes[i] - axis_smoothing_end_values[i]) < 16) {
+        // if smoothing is disabled, not to be smoothed, or close enough, jump to the end
+        if (smoothing_time == 0 || !axis_smoothing_flags[i] ||
+            std::abs(axes[i] - axis_smoothing_end_values[i]) < 16) {
             if (axes[i] != axis_smoothing_end_values[i]) {
                 axes[i] = axis_smoothing_end_values[i];
             }
             continue;
         }
         auto now = Libraries::Kernel::sceKernelGetProcessTime();
-        f32 t =
-            std::clamp((now - axis_smoothing_start_times[i]) / f32{axis_smoothing_time}, 0.f, 1.f);
+        f32 t = std::clamp((now - axis_smoothing_start_times[i]) / static_cast<f32>(smoothing_time),
+                           0.f, 1.f);
         axes[i] = s32(axis_smoothing_start_values[i] * (1 - t) + axis_smoothing_end_values[i] * t);
     }
 }
@@ -117,11 +133,13 @@ int GameController::ReadStates(State* states, int states_num, bool* isConnected,
 }
 
 void GameController::Button(OrbisPadButtonDataOffset button, bool is_pressed) {
+    Input::RecordButton(static_cast<u32>(button), is_pressed);
     m_state.OnButton(button, is_pressed);
     PushState();
 }
 
 void GameController::Axis(Input::Axis axis, int value, bool smooth) {
+    Input::RecordAxis(static_cast<u32>(axis), value);
     m_state.OnAxis(axis, value, smooth);
     PushState();
 }
@@ -267,6 +285,22 @@ bool is_first_check = true;
 
 void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
+    if (Common::IsBenchmarkMode()) {
+        // Never grab physical controllers in benchmark mode, so a concurrent
+        // normal session keeps exclusive input. Instead register a single
+        // virtual controller on slot 0 (mirrors the no-controller path below)
+        // that the scripted bench input driver (input/bench_input.cpp) drives.
+        if (is_first_check) {
+            is_first_check = false;
+            if (auto u = UserManagement.GetUserByPlayerIndex(1)) {
+                controllers[0]->user_id = u->user_id;
+                controllers[0]->ConnectController(nullptr);
+                UserManagement.LoginUser(u, 1);
+                LOG_INFO(Input, "Bench mode: virtual controller connected on slot 0");
+            }
+        }
+        return;
+    }
     int controller_count;
     s32 move_count = 0;
     SDL_JoystickID* new_joysticks = SDL_GetGamepads(&controller_count);
