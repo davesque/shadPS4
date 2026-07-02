@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <ranges>
 
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/stutter_log.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -313,38 +316,147 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+
+    // Enable async graphics-pipeline compilation only when the device supports
+    // dynamic vertex input (so the worker never reads guest vertex buffers) and
+    // shader-collect debug mode is off (it mutates a non-thread-safe map). The
+    // worker is created last, after pipeline_cache is valid and WarmUp() ran.
+    async_enabled = EmulatorSettings.IsAsyncPipelineCompile() &&
+                    instance.IsVertexInputDynamicState() && !EmulatorSettings.IsShaderCollect();
+    if (async_enabled) {
+        compile_worker = std::jthread([this](std::stop_token stop) { CompileWorker(stop); });
+    }
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    if (compile_worker.joinable()) {
+        compile_worker.request_stop();
+        compile_worker.join();
+    }
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
-    const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
-    if (is_new) {
-        const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
-        LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
-        GraphicsPipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+    if (!async_enabled) {
+        // Synchronous path (original behavior): compile inline, blocking this thread.
+        const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+        if (is_new) {
+            const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+            LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
-        RegisterPipelineData(graphics_key, pipeline_hash, sdata);
-        ++num_new_pipelines;
+            GraphicsPipeline::SerializationSupport sdata{};
+            {
+                Common::StutterScope _prof{Common::StutterCat::Pipeline, "GFX_PSO"};
+                it.value() = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+                    runtime_infos, fetch_shader, modules, sdata, false);
+            }
 
-        if (EmulatorSettings.IsShaderCollect()) {
-            for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-                if (infos[stage]) {
-                    auto& m = modules[stage];
-                    module_related_pipelines[m].emplace_back(graphics_key);
+            RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+            ++num_new_pipelines;
+
+            if (EmulatorSettings.IsShaderCollect()) {
+                for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+                    if (infos[stage]) {
+                        auto& m = modules[stage];
+                        module_related_pipelines[m].emplace_back(graphics_key);
+                    }
                 }
             }
+            fetch_shader.reset();
         }
-        fetch_shader.reset();
+        return it->second.get();
     }
-    return it->second.get();
+
+    // Async path: compile new pipelines on the worker thread; return nullptr (the
+    // rasterizer skips the draw) until the pipeline is ready, then it appears.
+    {
+        std::scoped_lock lk{graphics_mutex};
+        if (const auto it = graphics_pipelines.find(graphics_key);
+            it != graphics_pipelines.end()) {
+            // A present entry is either ready (non-null) or still compiling (null
+            // placeholder => .get() is nullptr => caller skips). Never re-enqueue.
+            return it->second.get();
+        }
+        // First sight: reserve a null placeholder so repeat draws don't re-enqueue.
+        graphics_pipelines.emplace(graphics_key, nullptr);
+        ++num_new_pipelines;
+    }
+
+    const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+    LOG_INFO(Render_Vulkan, "Queuing graphics pipeline {:#x} for async compilation", pipeline_hash);
+    auto task = BuildGraphicsCompileTask(pipeline_hash);
+    fetch_shader.reset();
+    if (!compile_queue.TryEmplace(std::move(task))) {
+        // Queue full: drop the placeholder so this pipeline is retried next frame.
+        std::scoped_lock lk{graphics_mutex};
+        graphics_pipelines.erase(graphics_key);
+    }
+    return nullptr;
+}
+
+GraphicsCompileTask PipelineCache::BuildGraphicsCompileTask(u64 pipeline_hash) {
+    // Runs on the GPU command-processor thread where the cache members populated
+    // by RefreshGraphicsKey() are valid. Captures a self-contained snapshot so the
+    // worker never touches live cache state.
+    GraphicsCompileTask task;
+    task.key = graphics_key;
+    task.runtime_infos = runtime_infos;
+    task.modules = modules;
+    task.fetch_shader = fetch_shader;
+    task.pipeline_hash = pipeline_hash;
+    for (size_t stage = 0; stage < MaxShaderStages; ++stage) {
+        task.cache_infos[stage] = infos[stage];
+        if (infos[stage] != nullptr) {
+            task.infos_owned[stage] = *infos[stage];
+            // Detach the dangling guest-memory user_data span; construction only
+            // needs the copied static resource declarations + owned flattened_ud_buf.
+            task.infos_owned[stage]->user_data = {};
+        }
+    }
+    return task;
+}
+
+void PipelineCache::PublishGraphicsPipeline(const GraphicsPipelineKey& key,
+                                            std::unique_ptr<GraphicsPipeline> pipeline) {
+    std::scoped_lock lk{graphics_mutex};
+    if (const auto it = graphics_pipelines.find(key); it != graphics_pipelines.end()) {
+        it.value() = std::move(pipeline);
+    }
+}
+
+void PipelineCache::CompileWorker(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadPS4:ShaderCompiler");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+
+    GraphicsCompileTask task;
+    while (!stop.stop_requested()) {
+        compile_queue.PopWait(task, stop);
+        if (stop.stop_requested()) {
+            break;
+        }
+
+        // Rebuild pointers to the now address-stable owned snapshots.
+        std::array<const Shader::Info*, MaxShaderStages> info_ptrs{};
+        for (size_t stage = 0; stage < MaxShaderStages; ++stage) {
+            info_ptrs[stage] = task.infos_owned[stage] ? &*task.infos_owned[stage] : nullptr;
+        }
+
+        GraphicsPipeline::SerializationSupport sdata{};
+        auto pipeline = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, task.key, *pipeline_cache, info_ptrs,
+            task.runtime_infos, task.fetch_shader, task.modules, sdata, false);
+
+        // Swap the construction snapshots for the live program_cache infos that
+        // draw-time BindResources reads for per-draw resource binding.
+        pipeline->SetStages(std::span<const Shader::Info* const>{task.cache_infos});
+
+        RegisterPipelineData(task.key, task.pipeline_hash, sdata);
+        PublishGraphicsPipeline(task.key, std::move(pipeline));
+    }
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -357,9 +469,12 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         ComputePipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *infos[0],
-                                                       modules[0], sdata, false);
+        {
+            Common::StutterScope _prof{Common::StutterCat::Pipeline, "COMPUTE_PSO"};
+            it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                           *pipeline_cache, compute_key, *infos[0],
+                                                           modules[0], sdata, false);
+        }
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
@@ -606,6 +721,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
                                               Shader::Backend::Bindings& binding) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
+    Common::StutterScope _prof{Common::StutterCat::Translate, "TRANSLATE"};
     DumpShader(code, info.pgm_hash, info.stage, perm_idx, "bin");
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);

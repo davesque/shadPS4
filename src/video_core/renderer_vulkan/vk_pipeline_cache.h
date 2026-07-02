@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <mutex>
 #include <variant>
 #include <tsl/robin_map.h>
+#include "common/bounded_threadsafe_queue.h"
+#include "common/polyfill_thread.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -63,6 +66,26 @@ struct Program {
     }
 };
 
+// A self-contained unit of work for the async graphics-pipeline compiler. Built
+// on the GPU command-processor thread (where guest state is valid) and consumed
+// by a background worker which never touches live cache state.
+struct GraphicsCompileTask {
+    GraphicsPipelineKey key;
+    // Owned Info snapshots used only to construct the pipeline on the worker.
+    // Their dangling guest-memory user_data span is cleared (mirrors how
+    // preloaded pipelines are built without live draw state). info pointers to
+    // these are rebuilt in the worker after the task settles at its final
+    // address (so they survive being moved through the queue).
+    std::array<std::optional<Shader::Info>, MaxShaderStages> infos_owned{};
+    // Live program_cache Info pointers; the finished pipeline's stages are
+    // re-pointed to these for correct per-draw binding.
+    std::array<const Shader::Info*, MaxShaderStages> cache_infos{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    u64 pipeline_hash{};
+};
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
@@ -109,6 +132,12 @@ private:
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
 
+    // Async graphics pipeline compilation.
+    GraphicsCompileTask BuildGraphicsCompileTask(u64 pipeline_hash);
+    void PublishGraphicsPipeline(const GraphicsPipelineKey& key,
+                                 std::unique_ptr<GraphicsPipeline> pipeline);
+    void CompileWorker(std::stop_token stop);
+
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
     }
@@ -137,6 +166,15 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // Async graphics pipeline compilation. When enabled, graphics_pipelines and
+    // num_new_pipelines are guarded by graphics_mutex (the GPU thread reserves a
+    // null placeholder + enqueues; the worker fills it). compile_worker MUST be
+    // declared last so it is stopped & joined before the members it captures.
+    bool async_enabled{};
+    std::mutex graphics_mutex;
+    Common::MPSCQueue<GraphicsCompileTask> compile_queue;
+    std::jthread compile_worker;
 };
 
 } // namespace Vulkan

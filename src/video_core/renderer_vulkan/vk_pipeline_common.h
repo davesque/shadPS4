@@ -53,6 +53,15 @@ public:
         return *stages[u32(stage)];
     }
 
+    // Re-point the per-stage Shader::Info pointers. Async pipeline compilation
+    // builds the pipeline from owned Info snapshots, then swaps them back to the
+    // live program_cache Info that draw-time BindResources reads.
+    void SetStages(std::span<const Shader::Info* const> new_stages) noexcept {
+        for (size_t i = 0; i < new_stages.size(); ++i) {
+            stages[i] = new_stages[i];
+        }
+    }
+
     bool IsCompute() const {
         return is_compute;
     }

@@ -373,6 +373,7 @@ struct GPUSettings {
     Setting<bool> direct_memory_access_enabled{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
+    Setting<bool> async_pipeline_compile{true};
     Setting<u32> vblank_frequency{60};
     Setting<bool> full_screen{false};
     Setting<std::string> full_screen_mode{"Windowed"};
@@ -397,6 +398,8 @@ struct GPUSettings {
             make_override<GPUSettings>("rcas_attenuation", &GPUSettings::rcas_attenuation),
             make_override<GPUSettings>("dump_shaders", &GPUSettings::dump_shaders),
             make_override<GPUSettings>("patch_shaders", &GPUSettings::patch_shaders),
+            make_override<GPUSettings>("async_pipeline_compile",
+                                       &GPUSettings::async_pipeline_compile),
             make_override<GPUSettings>("readbacks_mode", &GPUSettings::readbacks_mode),
             make_override<GPUSettings>("readback_linear_images_enabled",
                                        &GPUSettings::readback_linear_images_enabled),
@@ -411,7 +414,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    readbacks_mode, readback_linear_images_enabled,
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
+                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
+                                   async_pipeline_compile)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -657,6 +661,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
+    SETTING_FORWARD_BOOL(m_gpu, AsyncPipelineCompile, async_pipeline_compile)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
