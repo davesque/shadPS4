@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include "common/alignment.h"
 #include "common/debug.h"
+#include "common/stutter_log.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -82,10 +84,20 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    // Profiling: time the guest-thread stall caused by a GPU->CPU readback
+    // (synchronous SendCommand: the guest blocks until the GPU produces the data).
+    // A leading in-game stutter suspect. Threshold-gated to keep the log small.
+    const auto profile_t0 = std::chrono::steady_clock::now();
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         DownloadBufferMemory<false>(buffer, device_addr, size, is_write);
     });
+    const double profile_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - profile_t0)
+            .count();
+    if (profile_ms > 0.5) {
+        Common::ProfileLog("READBACK", profile_ms);
+    }
 }
 
 template <bool async>
@@ -712,6 +724,19 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
     if (copies.empty()) {
         return VK_NULL_HANDLE;
     }
+    // Profiling: time buffer (geometry/vertex/index/uniform) streaming uploads --
+    // CPU copy into staging (+ any staging-ring wait). The suspect for the
+    // remaining in-game spikes that had no texture/wait activity. Threshold-gated.
+    const auto profile_t0 = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        const double profile_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - profile_t0)
+                .count();
+        Common::StutterAdd(Common::StutterCat::BufUpload, profile_ms);
+        if (profile_ms > 0.5) {
+            Common::ProfileLog("BUF_UPLOAD", profile_ms);
+        }
+    };
     const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
     if (staging) {
         for (auto& copy : copies) {

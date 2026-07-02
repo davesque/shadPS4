@@ -432,6 +432,12 @@ private:
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
+    // GPU busy-time measurement via timestamp queries (gated by SHAD_PRESENT_LOG).
+    void InitGpuTiming();
+    void GpuTimingCmdStart();          // reset + write start timestamp into current_cmdbuf
+    void GpuTimingCmdEnd(u64 gpu_tick); // write end timestamp, tag with completion tick
+    void GpuTimingReadback();          // read completed pairs, accumulate GPU-busy ms
+
 private:
     const Instance& instance;
     MasterSemaphore master_semaphore;
@@ -451,6 +457,16 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+
+    // GPU-busy timestamp query state. All touched only under submit_mutex (or the
+    // constructor), so no extra locking. Each "pair" is a start+end timestamp
+    // around one submitted command buffer.
+    static constexpr u32 kTsPairs = 256;
+    vk::UniqueQueryPool timestamp_pool;
+    double timestamp_period_ns = 0.0;
+    bool gpu_timing_enabled = false;
+    u32 ts_index = 0;
+    std::array<u64, kTsPairs> ts_tick{}; // completion tick per pending pair (0 = free)
 };
 
 } // namespace Vulkan

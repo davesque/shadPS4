@@ -3,10 +3,13 @@
 
 #include "layer.h"
 
+#include <cstdio>
+
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
 #include "SDL3/SDL_log.h"
+#include "common/present_log.h"
 #include "common/singleton.h"
 #include "common/types.h"
 #include "core/debug_state.h"
@@ -401,6 +404,32 @@ void L::Draw() {
         ImVec2 pos = ImVec2(10, 10);
         ImU32 color = IM_COL32(255, 255, 255, 255);
         ImGui::GetForegroundDrawList()->AddText(pos, color, "Emulation Paused");
+    }
+
+    // Always-visible telemetry readout (foreground draw list -> can't be parked
+    // off-screen like the "Video Info" window). Gated by SHAD_PRESENT_LOG so it
+    // only appears during a diagnostic session. Lets the user A/B our measured
+    // present rate against an external overlay (e.g. Nvidia) on the same screen.
+    if (Common::PresentLogEnabled()) {
+        const auto o = Common::PresentGetOnscreen();
+        char buf[192];
+        if (o.valid) {
+            std::snprintf(buf, sizeof(buf),
+                          "shadPS4 present: %.0f fps | submit %.0f | gpubusy %.0f ms/s | gpuwait "
+                          "%.1f | worst %.1f | phase %.1f%s",
+                          o.fps, o.submit, o.gpubusy, o.gpuwait, o.worst, o.phase,
+                          o.phase_warn ? " !! VBLANK BOUNDARY" : "");
+        } else {
+            std::snprintf(buf, sizeof(buf), "shadPS4 present: measuring...");
+        }
+        auto* dl = ImGui::GetForegroundDrawList();
+        const ImVec2 pos{10.0f, 40.0f};
+        // Draw a shadow then bright text so it's readable over any scene. Flips
+        // red while the pacer is parked on the vblank boundary (phase warning).
+        const ImU32 text_color =
+            o.valid && o.phase_warn ? IM_COL32(255, 64, 64, 255) : IM_COL32(255, 255, 0, 255);
+        dl->AddText(ImVec2{pos.x + 1.0f, pos.y + 1.0f}, IM_COL32(0, 0, 0, 220), buf);
+        dl->AddText(pos, text_color, buf);
     }
 
     if (show_simple_fps) {

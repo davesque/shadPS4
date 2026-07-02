@@ -8,9 +8,11 @@
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
 #include <cmrc/cmrc.hpp>
+#include <cstdlib>
 #include <stb_image.h>
 
 #include "common/assert.h"
+#include "common/bench.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/logging/formatter.h"
@@ -96,6 +98,16 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
     return interval;
 }
 
+// Benchmark observability: periodically request a game-only screenshot so the
+// headless closed loop can be inspected after the fact (read the PNGs in the
+// portable user dir's screenshots folder to see title/menu/in-world state and
+// calibrate scripted input timing). Registered only in benchmark mode when
+// SHAD_SCREENSHOT_INTERVAL is set.
+static Uint32 SDLCALL BenchScreenshot(void* userdata, SDL_TimerID timer_id, Uint32 interval) {
+    VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+    return interval;
+}
+
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
                      std::string_view window_title)
     : width{width_}, height{height_}, controllers{*controllers_} {
@@ -110,14 +122,32 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     }
     SDL_InitSubSystem(SDL_INIT_AUDIO);
 
+    if (Common::IsBenchmarkMode()) {
+        // Don't steal focus / come to the foreground so the perf harness can run
+        // alongside a normal session.
+        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "0");
+        SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "0");
+    }
+
     SDL_PropertiesID props = SDL_CreateProperties();
-    SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING,
-                          std::string(window_title).c_str());
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    const std::string title =
+        Common::IsBenchmarkMode() ? std::string("bench shadPS4") : std::string(window_title);
+    SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title.c_str());
+    // In benchmark mode, create the window far off-screen so it can never appear
+    // over a concurrent normal session. Full size is kept so the swapchain is valid.
+    const Sint64 win_pos =
+        Common::IsBenchmarkMode() ? -32000 : static_cast<Sint64>(SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, win_pos);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, win_pos);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height);
-    SDL_SetNumberProperty(props, "flags", SDL_WINDOW_VULKAN);
+    SDL_WindowFlags win_flags = SDL_WINDOW_VULKAN;
+    if (Common::IsBenchmarkMode()) {
+        // Not focusable at creation time so it never steals focus/foreground.
+        win_flags |= SDL_WINDOW_NOT_FOCUSABLE;
+    }
+    SDL_SetNumberProperty(props, "flags", static_cast<Sint64>(win_flags));
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
@@ -126,6 +156,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     }
 
     SDL_SetWindowMinimumSize(window, 640, 360);
+
+    if (Common::IsBenchmarkMode()) {
+        SDL_SetWindowFocusable(window, false);
+        SDL_SetWindowPosition(window, -32000, -32000);
+    }
 
     bool error = false;
     const SDL_DisplayID displayIndex = SDL_GetDisplayForWindow(window);
@@ -142,7 +177,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
         SDL_SetWindowFullscreenMode(
             window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? displayMode : NULL);
     }
-    SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
+    SDL_SetWindowFullscreen(window,
+                            !Common::IsBenchmarkMode() && EmulatorSettings.IsFullScreen());
     SDL_SyncWindow(window);
 
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
@@ -353,6 +389,14 @@ void WindowSDL::InitTimers() {
         SDL_AddTimer(4, &PollController, controllers[i]);
     }
     SDL_AddTimer(33, Input::MousePolling, (void*)controllers[0]);
+    if (Common::IsBenchmarkMode()) {
+        if (const char* iv = std::getenv("SHAD_SCREENSHOT_INTERVAL"); iv != nullptr && *iv != '\0') {
+            const double secs = std::atof(iv);
+            if (secs > 0.0) {
+                SDL_AddTimer(static_cast<Uint32>(secs * 1000.0), &BenchScreenshot, nullptr);
+            }
+        }
+    }
 }
 
 void WindowSDL::RequestKeyboard() {

@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/bench.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/present_log.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -30,6 +32,7 @@
 #include <chrono>
 #include <cmath>
 #include <csetjmp>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -181,6 +184,36 @@ static std::vector<std::filesystem::path> BuildScreenshotPaths(const ScreenshotK
 
     const auto game_id =
         SanitizeFilenameComponent(std::string(Common::ElfInfo::Instance().GameSerial()));
+
+    const char* suffix = kind == ScreenshotKind::GameOnly ? "game" : "hud";
+    const auto first_sequence = screenshot_sequence.fetch_add(count, std::memory_order_relaxed);
+
+    // Benchmark mode: when SHAD_SCREENSHOT_MAX is set, write into a fixed-size
+    // ring of reused filenames (game_id_suffix_NNN.png) so the headless harness
+    // can't fill the disk over a long run. With count <= ring size the indices
+    // stay ordered (clean for calibration); past that it wraps and keeps the
+    // newest ring-size shots (use file mtime for recency).
+    static const u32 bench_ring = []() -> u32 {
+        if (!Common::IsBenchmarkMode()) {
+            return 0;
+        }
+        const char* m = std::getenv("SHAD_SCREENSHOT_MAX");
+        if (m == nullptr || *m == '\0') {
+            return 0;
+        }
+        const long v = std::atol(m);
+        return v > 0 ? static_cast<u32>(v) : 0;
+    }();
+    if (bench_ring > 0) {
+        paths.reserve(count);
+        for (u32 i = 0; i < count; ++i) {
+            const u64 idx = (first_sequence + i) % bench_ring;
+            paths.emplace_back(screenshots_dir /
+                               fmt::format("{}_{}_{:04}.png", game_id, suffix, idx));
+        }
+        return paths;
+    }
+
     const auto now = std::chrono::system_clock::now();
     const auto now_time = std::chrono::system_clock::to_time_t(now);
     const auto ms =
@@ -197,9 +230,6 @@ static std::vector<std::filesystem::path> BuildScreenshotPaths(const ScreenshotK
     std::ostringstream stamp;
     stamp << std::put_time(&local_tm, "%Y%m%d_%H%M%S") << '_' << std::setw(3) << std::setfill('0')
           << ms;
-
-    const char* suffix = kind == ScreenshotKind::GameOnly ? "game" : "hud";
-    const auto first_sequence = screenshot_sequence.fetch_add(count, std::memory_order_relaxed);
 
     paths.reserve(count);
     const auto stamp_str = stamp.str();
@@ -870,15 +900,26 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
-    if (!swapchain.AcquireNextImage()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    {
+        // Acquire stall == waiting for a free swapchain image == GPU/present
+        // backpressure. High here means we are GPU-bound, not pacing-bound.
+        Common::PresentScope acquire_scope{Common::PresentStage::Acquire};
         if (!swapchain.AcquireNextImage()) {
-            // User resizes the window too fast and GPU can't keep up. Skip this frame.
-            LOG_WARNING(Render_Vulkan, "Skipping frame!");
-            free_frame();
-            return;
+            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+            if (!swapchain.AcquireNextImage()) {
+                // User resizes the window too fast and GPU can't keep up. Skip this frame.
+                LOG_WARNING(Render_Vulkan, "Skipping frame!");
+                free_frame();
+                return;
+            }
         }
     }
+
+    // Start of command-buffer recording (ImGui + blit) for the present-cost log;
+    // measured up to the Flush below.
+    const auto record_t0 = Common::PresentLogEnabled()
+                               ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
 
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
@@ -1085,15 +1126,30 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
             [deferred_screenshots]() { SavePendingScreenshots(*deferred_screenshots); });
     }
 
+    if (Common::PresentLogEnabled()) {
+        Common::PresentMark(Common::PresentStage::Record,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - record_t0)
+                                .count());
+    }
+
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
-    scheduler.Flush(info);
+    {
+        // CPU cost of submitting the present command buffer (may fold in a GPU
+        // wait if the scheduler stalls on an in-flight tick).
+        Common::PresentScope flush_scope{Common::PresentStage::Flush};
+        scheduler.Flush(info);
+    }
 
     // Present to swapchain.
     {
+        // vkQueuePresentKHR. With a FIFO swapchain this blocks to vsync; with
+        // Mailbox/Immediate it returns fast (backpressure shows up in acquire).
+        Common::PresentScope qpresent_scope{Common::PresentStage::QPresent};
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());

@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdlib>
 #include <xxhash.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/logging/log.h"
+#include "common/stutter_log.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -717,6 +721,19 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    // Profiling: time texture (re)upload — CPU-side dirty hashing + detile/upload
+    // command recording. A leading suspect for traversal stutter (new assets
+    // streaming in). Threshold-gated; cheap early-outs (clean/unchanged) won't log.
+    const auto profile_t0 = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        const double profile_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - profile_t0)
+                .count();
+        Common::StutterAdd(Common::StutterCat::TexUpload, profile_ms);
+        if (profile_ms > 0.5) {
+            Common::ProfileLog("TEX_UPLOAD", profile_ms);
+        }
+    };
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
@@ -742,6 +759,36 @@ void TextureCache::RefreshImage(Image& image) {
             return;
         }
         image.hash = hash;
+    }
+
+    // --- EXPERIMENTAL: per-frame texture-upload budget (SHAD_TEX_BUDGET_MB) ---
+    // Root cause of in-game traversal stutter is synchronous texture streaming:
+    // a burst of RefreshImage uploads (CPU copy + detile/upload, plus the rare
+    // staging-ring wait) blocks the frame. This caps the upload bytes per ~16ms
+    // window and DEFERS the rest by returning early while leaving the image Dirty
+    // (it re-uploads on a later bind -> the texture pops in a frame or two late,
+    // the standard async-streaming trade-off). Placed BEFORE the mip-hash loop so
+    // a deferred image isn't prematurely marked clean. Off unless the env is set.
+    static const u64 tex_budget_bytes = []() -> u64 {
+        const char* m = std::getenv("SHAD_TEX_BUDGET_MB");
+        const u64 mb = (m != nullptr && *m != '\0') ? static_cast<u64>(std::atoll(m)) : 0;
+        if (mb > 0) {
+            LOG_INFO(Render_Vulkan, "Texture upload budget ACTIVE: {} MB per ~16ms window", mb);
+        }
+        return mb * 1024 * 1024;
+    }();
+    if (tex_budget_bytes > 0) {
+        static auto budget_window_start = std::chrono::steady_clock::now();
+        static u64 budget_used = 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - budget_window_start > std::chrono::milliseconds(16)) {
+            budget_window_start = now;
+            budget_used = 0;
+        }
+        if (budget_used >= tex_budget_bytes) {
+            return; // defer: image stays Dirty, re-uploaded on a later frame
+        }
+        budget_used += image.info.guest_size;
     }
 
     const u32 num_layers = image.info.resources.layers;

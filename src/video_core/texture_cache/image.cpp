@@ -3,6 +3,7 @@
 
 #include <ranges>
 #include "common/assert.h"
+#include "common/stutter_log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -123,6 +124,9 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
              const ImageInfo& info_)
     : instance{&instance_}, scheduler{&scheduler_}, blit_helper{&blit_helper_},
       slot_image_views{&slot_image_views_}, info{info_} {
+    // Telemetry: time image creation (vkCreateImage + device-memory allocation) —
+    // the un-instrumented suspect for in-game frame spikes with no compile/upload/wait.
+    Common::StutterScope _prof{Common::StutterCat::ImgCreate, "IMG_CREATE"};
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
