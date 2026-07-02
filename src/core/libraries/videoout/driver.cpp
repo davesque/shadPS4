@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -13,10 +16,101 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <dwmapi.h>
+#endif
+
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
+
+// The host display rarely runs at exactly the configured vblank frequency (e.g.
+// many "60 Hz" panels scan out at 59.94 or 59.997 Hz). Pacing presents with a
+// free-running software timer at 60.000 against such a display sheds the
+// surplus frames in the compositor, which surfaces as periodic multi-second
+// judder whenever the two clocks drift through phase alignment. Pace at the
+// compositor's actual refresh rate instead when it is close to the configured
+// one, and (on Windows) phase-lock the timer to the compositor's vblank clock
+// so residual ppm-level clock error cannot park the tick on the vblank
+// boundary. Opt out with SHAD_NO_DISPLAY_PACE=1.
+struct PresentPacing {
+    std::chrono::nanoseconds period;
+    bool display_locked; // true -> period came from the display; PLL may engage
+};
+
+static PresentPacing DeterminePresentPacing() {
+    const u32 configured_hz = EmulatorSettings.GetVblankFrequency();
+    const std::chrono::nanoseconds configured_period(1000000000 / configured_hz);
+#ifdef _WIN32
+    if (std::getenv("SHAD_NO_DISPLAY_PACE") != nullptr) {
+        LOG_INFO(Lib_VideoOut, "Display-rate pacing disabled by SHAD_NO_DISPLAY_PACE");
+        return {configured_period, false};
+    }
+    DWM_TIMING_INFO timing{};
+    timing.cbSize = sizeof(timing);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing)) ||
+        timing.rateRefresh.uiDenominator == 0) {
+        LOG_WARNING(Lib_VideoOut, "DwmGetCompositionTimingInfo failed, pacing at {} Hz",
+                    configured_hz);
+        return {configured_period, false};
+    }
+    const double display_hz = static_cast<double>(timing.rateRefresh.uiNumerator) /
+                              static_cast<double>(timing.rateRefresh.uiDenominator);
+    // Only adopt the display rate when it is within 2% of the configured
+    // frequency; otherwise the user intends a rate the display does not run at
+    // (e.g. vblankFrequency=120 on a 60 Hz panel) and pacing must stay free-run.
+    if (std::abs(display_hz - static_cast<double>(configured_hz)) >
+        static_cast<double>(configured_hz) * 0.02) {
+        LOG_INFO(Lib_VideoOut,
+                 "Display refresh {:.4f} Hz differs from configured {} Hz, pacing at configured "
+                 "rate",
+                 display_hz, configured_hz);
+        return {configured_period, false};
+    }
+    const auto period = std::chrono::nanoseconds(static_cast<s64>(1e9 / display_hz));
+    LOG_INFO(Lib_VideoOut,
+             "Pacing presents at display refresh {:.4f} Hz ({}/{}), configured {} Hz, "
+             "vblank phase lock enabled",
+             display_hz, timing.rateRefresh.uiNumerator, timing.rateRefresh.uiDenominator,
+             configured_hz);
+    return {period, true};
+#else
+    return {configured_period, false};
+#endif
+}
+
+#ifdef _WIN32
+// One phase-lock step: measure where this tick landed inside the display's
+// vblank interval and nudge the timer toward mid-interval, the point farthest
+// from both boundaries. Bounded proportional steering (max 200us/tick, gain
+// 1/16) locks from a worst-case 8.3ms error in about a second and is immune to
+// an occasional bad DWM sample.
+static void PhaseLockStep(Common::AccurateTimer& timer) {
+    static const s64 qpc_freq = []() {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<s64>(f.QuadPart);
+    }();
+    DWM_TIMING_INFO timing{};
+    timing.cbSize = sizeof(timing);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing)) || timing.qpcRefreshPeriod == 0) {
+        return;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const s64 period = static_cast<s64>(timing.qpcRefreshPeriod);
+    s64 phase = (now.QuadPart - static_cast<s64>(timing.qpcVBlank)) % period;
+    if (phase < 0) {
+        phase += period;
+    }
+    const s64 error_ns = (phase - period / 2) * 1'000'000'000 / qpc_freq;
+    constexpr s64 kMaxStepNs = 200'000;
+    const s64 step = std::clamp(error_ns / 16, -kMaxStepNs, kMaxStepNs);
+    timer.Adjust(std::chrono::nanoseconds(-step));
+}
+#endif
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
@@ -337,8 +431,8 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
-    const std::chrono::nanoseconds vblank_period(1000000000 /
-                                                 EmulatorSettings.GetVblankFrequency());
+    const PresentPacing pacing = DeterminePresentPacing();
+    const std::chrono::nanoseconds vblank_period = pacing.period;
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
@@ -357,6 +451,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     while (!token.stop_requested()) {
         timer.Start();
+
+#ifdef _WIN32
+        if (pacing.display_locked) {
+            PhaseLockStep(timer);
+        }
+#endif
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
