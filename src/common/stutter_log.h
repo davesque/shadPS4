@@ -22,6 +22,7 @@ enum class StutterCat : int {
     BufUpload, // BufferCache::UploadCopies (geometry/vertex/index/uniform staging)
     ImgCreate, // Image ctor (vkCreateImage + device-memory allocation)
     GpuWait,   // Scheduler::Wait (CPU blocked on GPU)
+    FileIo,    // guest file reads (ReadFile funnel: host I/O + cache invalidation)
     Count,
 };
 

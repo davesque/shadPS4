@@ -18,8 +18,10 @@
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/present_log.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
+#include "common/stutter_log.h"
 #include "core/file_sys/devices/console_device.h"
 #include "core/file_sys/devices/deci_tty_device.h"
 #include "core/file_sys/devices/logger.h"
@@ -364,6 +366,24 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes) {
 static thread_local std::vector<u8> file_buf{};
 
 s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
+    // Telemetry: every guest file read funnels through here. Time spent inside
+    // (host I/O + cache invalidation) is charged to the "fileio" stutter
+    // category and the per-second io counters, so a multi-second load freeze
+    // can be split into emulator I/O vs guest-side work (decompression).
+    const bool timed = Common::PresentLogEnabled();
+    const auto t0 =
+        timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    s64 bytes = 0;
+    SCOPE_EXIT {
+        if (timed) {
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                    .count();
+            Common::PresentAddIo(ms, bytes > 0 ? static_cast<u64>(bytes) : 0);
+            Common::StutterAdd(Common::StutterCat::FileIo, ms);
+        }
+    };
+
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.
     const auto remaining = file->GetSize() - file->Tell();
@@ -371,7 +391,7 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     if (file_buf.capacity() < nbytes) {
         file_buf.reserve(nbytes);
     }
-    s64 bytes = file->Read(file_buf.data(), nbytes);
+    bytes = file->Read(file_buf.data(), nbytes);
     if (bytes < 0) {
         return bytes;
     }
