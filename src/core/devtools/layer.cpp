@@ -493,14 +493,17 @@ void L::Draw() {
                 }
                 dl->AddPolyline(pts.data(), window, c.color, 0, 1.5f);
                 // Metric name above the chart; current value and window
-                // min/max below it, e.g. "60.0 [25.3,60.0]".
-                dl->AddText(ImVec2{x0 + 3.0f, y0 - 15.0f}, IM_COL32(0, 0, 0, 220), c.name);
-                dl->AddText(ImVec2{x0 + 2.0f, y0 - 16.0f}, c.color, c.name);
+                // min/max below it, e.g. "60.0 [25.3,60.0]". Position from the
+                // live font height -- the UI font is DPI-scaled, so fixed pixel
+                // offsets overlap the chart on high-res displays.
+                const float fh = ImGui::GetFontSize();
+                dl->AddText(ImVec2{x0 + 3.0f, y0 - fh - 2.0f}, IM_COL32(0, 0, 0, 220), c.name);
+                dl->AddText(ImVec2{x0 + 2.0f, y0 - fh - 3.0f}, c.color, c.name);
                 char figures[64];
                 std::snprintf(figures, sizeof(figures), "%.1f [%.1f,%.1f]",
                               sample(*c.data, window - 1), raw_min, raw_max);
-                dl->AddText(ImVec2{x0 + 3.0f, y0 + kH + 3.0f}, IM_COL32(0, 0, 0, 220), figures);
-                dl->AddText(ImVec2{x0 + 2.0f, y0 + kH + 2.0f}, c.color, figures);
+                dl->AddText(ImVec2{x0 + 3.0f, y0 + kH + 4.0f}, IM_COL32(0, 0, 0, 220), figures);
+                dl->AddText(ImVec2{x0 + 2.0f, y0 + kH + 3.0f}, c.color, figures);
                 x0 += kW + kGap;
             }
             if (o.phase_warn) {
