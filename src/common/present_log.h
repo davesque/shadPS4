@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 
@@ -59,6 +60,22 @@ struct PresentOnscreen {
     bool valid;
 };
 PresentOnscreen PresentGetOnscreen();
+
+// Rolling per-second history of the summary values, for on-screen sparkline
+// charts. Ring buffer: sample i of the current window lives at
+// (count - window + i) % kN with window = min(count, kN). Written and read on
+// the present thread only.
+struct PresentSeries {
+    static constexpr int kN = 180; // 3 minutes at one sample/second
+    std::array<float, kN> fps;
+    std::array<float, kN> submit;
+    std::array<float, kN> worst;
+    std::array<float, kN> phase;
+    std::array<float, kN> gpubusy;
+    std::array<float, kN> gpuwait;
+    int count = 0; // total samples ever appended
+};
+const PresentSeries& PresentGetSeries();
 
 // Count one guest flip SUBMISSION (sceVideoOutSubmitFlip). Called from the guest
 // videoout thread -- the game's INTENDED framerate, before host pacing. Atomic.
