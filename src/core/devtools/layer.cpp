@@ -428,7 +428,11 @@ void L::Draw() {
         // least-squares trendline so drift is visible at a glance rather than
         // only in the log file afterwards.
         const auto& series = Common::PresentGetSeries();
-        const int window = std::min(series.count, Common::PresentSeries::kN);
+        // Fixed 30-sample viewport: samples enter at the right edge and scroll
+        // off the left (FIFO), rather than compressing the x-axis as history
+        // accumulates.
+        constexpr int kView = 30;
+        const int window = std::min({series.count, Common::PresentSeries::kN, kView});
         if (o.valid && window >= 2) {
             constexpr float kW = 240.0f, kH = 40.0f, kGap = 6.0f;
             float x0 = pos.x;
@@ -484,12 +488,17 @@ void L::Draw() {
                 const auto trend = [&](int i) {
                     return std::clamp(static_cast<float>(intercept + slope * i), vmin, vmax);
                 };
-                dl->AddLine(ImVec2{x0 + 2.0f, to_y(trend(0))},
-                            ImVec2{x0 + kW - 2.0f, to_y(trend(window - 1))},
+                // Right-align the window so the newest sample is always at the
+                // right edge; during warmup (fewer than kView samples) the line
+                // grows leftward from there.
+                const auto to_x = [&](int i) {
+                    return x0 + 2.0f + (kW - 4.0f) * (kView - window + i) / (kView - 1);
+                };
+                dl->AddLine(ImVec2{to_x(0), to_y(trend(0))},
+                            ImVec2{to_x(window - 1), to_y(trend(window - 1))},
                             IM_COL32(255, 255, 255, 130), 1.0f);
                 for (int i = 0; i < window; ++i) {
-                    pts[i] = ImVec2{x0 + 2.0f + (kW - 4.0f) * i / (window - 1),
-                                    to_y(sample(*c.data, i))};
+                    pts[i] = ImVec2{to_x(i), to_y(sample(*c.data, i))};
                 }
                 dl->AddPolyline(pts.data(), window, c.color, 0, 1.5f);
                 // Metric name above the chart; current value and window
@@ -502,8 +511,11 @@ void L::Draw() {
                 char figures[64];
                 std::snprintf(figures, sizeof(figures), "%.1f [%.1f,%.1f]",
                               sample(*c.data, window - 1), raw_min, raw_max);
-                dl->AddText(ImVec2{x0 + 3.0f, y0 + kH + 4.0f}, IM_COL32(0, 0, 0, 220), figures);
-                dl->AddText(ImVec2{x0 + 2.0f, y0 + kH + 3.0f}, c.color, figures);
+                // Flush against the box's bottom edge: glyphs render a few px
+                // below the text-cell origin, so a positive gap here reads
+                // roughly twice as large as the same gap above the box.
+                dl->AddText(ImVec2{x0 + 3.0f, y0 + kH + 1.0f}, IM_COL32(0, 0, 0, 220), figures);
+                dl->AddText(ImVec2{x0 + 2.0f, y0 + kH}, c.color, figures);
                 x0 += kW + kGap;
             }
             if (o.phase_warn) {
