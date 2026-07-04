@@ -4,8 +4,14 @@
 #pragma once
 
 #include <chrono>
+#include <filesystem>
 
 namespace Common {
+
+// Shift <path>.<k> -> <path>.<k+1> (dropping the oldest) and <path> ->
+// <path>.1, so per-session telemetry files keep the last few sessions instead
+// of truncating history on every launch. Used by the present and stutter logs.
+void RotateSessionLogs(const std::filesystem::path& path);
 
 // Host present-thread pacing + cost telemetry. When SHAD_PRESENT_LOG names a
 // file, emits one averaged summary line per second describing where each host

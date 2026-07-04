@@ -14,15 +14,8 @@
 
 namespace Common {
 
-namespace {
-
-constexpr int N = static_cast<int>(PresentStage::Count);
-
-// Keep telemetry from the last few sessions: shift <path>.<k> -> <path>.<k+1>
-// (dropping the oldest) and <path> -> <path>.1 before truncating <path>.
-constexpr int kRotatedSessions = 9;
-
-void RotatePresentLogs(const std::filesystem::path& path) {
+void RotateSessionLogs(const std::filesystem::path& path) {
+    constexpr int kRotatedSessions = 9;
     std::error_code ec;
     const auto numbered = [&path](int k) {
         std::filesystem::path p = path;
@@ -36,13 +29,17 @@ void RotatePresentLogs(const std::filesystem::path& path) {
     std::filesystem::rename(path, numbered(1), ec);
 }
 
+namespace {
+
+constexpr int N = static_cast<int>(PresentStage::Count);
+
 std::FILE* PresentFile() {
     static std::FILE* file = []() -> std::FILE* {
         const char* p = std::getenv("SHAD_PRESENT_LOG");
         if (p == nullptr || *p == '\0') {
             return nullptr;
         }
-        RotatePresentLogs(std::filesystem::path{p});
+        RotateSessionLogs(std::filesystem::path{p});
         return std::fopen(p, "w");
     }();
     return file;

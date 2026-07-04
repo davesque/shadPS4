@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <mutex>
 
+#include "common/present_log.h"
 #include "common/stutter_log.h"
 #include "common/types.h"
 
@@ -23,7 +25,11 @@ std::array<std::atomic<u64>, N> g_accum_us{};
 std::FILE* StutterFile() {
     static std::FILE* file = []() -> std::FILE* {
         const char* p = std::getenv("SHAD_STUTTER_LOG");
-        return (p != nullptr && *p != '\0') ? std::fopen(p, "w") : nullptr;
+        if (p == nullptr || *p == '\0') {
+            return nullptr;
+        }
+        RotateSessionLogs(std::filesystem::path{p});
+        return std::fopen(p, "w");
     }();
     return file;
 }
