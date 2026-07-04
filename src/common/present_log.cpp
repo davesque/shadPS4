@@ -58,6 +58,9 @@ u64 g_gpubusy_last = 0;
 // present thread, read on the (same) present/ImGui thread; plain is fine.
 PresentOnscreen g_onscreen{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1.0f, false, false};
 
+// Rolling history behind the on-screen sparkline charts (same threading).
+PresentSeries g_series{};
+
 // Active phase-parking detection: consecutive seconds the tick has spent within
 // kPhaseBandMs of a vblank boundary. Phase moves at ppm speed, so per-second
 // sampling can't miss a parking episode. Present thread only.
@@ -92,6 +95,10 @@ bool PresentLogEnabled() {
 
 PresentOnscreen PresentGetOnscreen() {
     return g_onscreen;
+}
+
+const PresentSeries& PresentGetSeries() {
+    return g_series;
 }
 
 void PresentCountSubmit() {
@@ -182,6 +189,14 @@ void PresentFrame(double interval_ms, double work_ms, double sleep_ms, double ta
                                  static_cast<float>(gpuwait_ms), static_cast<float>(gpubusy_ms),
                                  static_cast<float>(g_win.worst), static_cast<float>(g_win.phase),
                                  phase_warn,                     true};
+    const int slot = g_series.count % PresentSeries::kN;
+    g_series.fps[slot] = static_cast<float>(fps);
+    g_series.submit[slot] = static_cast<float>(submit_fps);
+    g_series.worst[slot] = static_cast<float>(g_win.worst);
+    g_series.phase[slot] = static_cast<float>(g_win.phase);
+    g_series.gpubusy[slot] = static_cast<float>(gpubusy_ms);
+    g_series.gpuwait[slot] = static_cast<float>(gpuwait_ms);
+    g_series.count += 1;
     std::fprintf(file,
                  "%.2f present n=%d fps=%.1f submit=%.1f worst=%.1f phase=%.2f gpuwait=%.1f "
                  "gpubusy=%.1f interval=%.2f work=%.2f acquire=%.2f record=%.2f flush=%.2f "
