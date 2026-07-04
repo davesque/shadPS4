@@ -7,6 +7,8 @@
 #include <chrono>
 #include <filesystem>
 
+#include "common/types.h"
+
 namespace Common {
 
 // Shift <path>.<k> -> <path>.<k+1> (dropping the oldest) and <path> ->
@@ -92,6 +94,16 @@ void PresentAddGpuWait(double ms);
 // the GPU has headroom and any framerate loss is elsewhere (display/present).
 // This is the one layer the present/submit counters can't see. Atomic.
 void PresentAddGpuBusy(double ms);
+
+// Add one guest file read: time spent inside the emulator's read funnel (host
+// I/O + cache invalidation) and bytes delivered. Per-second totals appear in
+// the log line as io= (reads/s), ioMB= (MB/s), ioms= (ms/s). Any thread.
+void PresentAddIo(double ms, u64 bytes);
+
+// Count one detiler compute dispatch (GPU-side GCN tiling conversion). Appears
+// per second as detile= in the log line; correlate with gpubusy to spot
+// re-upload/detile storms after streaming events. Any thread.
+void PresentCountDetile();
 
 // Add a sub-cost sample (ms) for the present currently in flight. Folded into
 // the window on the next PresentFrame call. PresentThread only. No-op if unset.

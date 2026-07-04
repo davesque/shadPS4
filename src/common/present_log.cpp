@@ -49,10 +49,18 @@ std::FILE* PresentFile() {
 std::atomic<u64> g_submit_count{0};  // guest flip submissions
 std::atomic<u64> g_gpuwait_us{0};    // CPU-blocked-on-GPU microseconds
 std::atomic<u64> g_gpubusy_us{0};    // GPU-busy microseconds (timestamp queries)
+std::atomic<u64> g_io_count{0};      // guest file reads
+std::atomic<u64> g_io_bytes{0};      // bytes delivered by guest file reads
+std::atomic<u64> g_io_us{0};         // microseconds inside the read funnel
+std::atomic<u64> g_detile_count{0};  // detiler compute dispatches
 // Snapshots taken at the last per-second emit, so we can diff.
 u64 g_submit_last = 0;
 u64 g_gpuwait_last = 0;
 u64 g_gpubusy_last = 0;
+u64 g_io_count_last = 0;
+u64 g_io_bytes_last = 0;
+u64 g_io_us_last = 0;
+u64 g_detile_last = 0;
 
 // Latest per-second summary, published for an on-screen readout. Written on the
 // present thread, read on the (same) present/ImGui thread; plain is fine.
@@ -122,6 +130,22 @@ void PresentAddGpuBusy(double ms) {
     g_gpubusy_us.fetch_add(static_cast<u64>(ms * 1000.0 + 0.5), std::memory_order_relaxed);
 }
 
+void PresentAddIo(double ms, u64 bytes) {
+    if (PresentFile() == nullptr) {
+        return;
+    }
+    g_io_count.fetch_add(1, std::memory_order_relaxed);
+    g_io_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    g_io_us.fetch_add(static_cast<u64>(ms * 1000.0 + 0.5), std::memory_order_relaxed);
+}
+
+void PresentCountDetile() {
+    if (PresentFile() == nullptr) {
+        return;
+    }
+    g_detile_count.fetch_add(1, std::memory_order_relaxed);
+}
+
 void PresentMark(PresentStage stage, double ms) {
     if (PresentFile() == nullptr) {
         return;
@@ -171,9 +195,27 @@ void PresentFrame(double interval_ms, double work_ms, double sleep_ms, double ta
         window_s > 0.0 ? static_cast<double>(gpuwait_cur - g_gpuwait_last) / 1000.0 / window_s : 0.0;
     const double gpubusy_ms =
         window_s > 0.0 ? static_cast<double>(gpubusy_cur - g_gpubusy_last) / 1000.0 / window_s : 0.0;
+    const u64 io_count_cur = g_io_count.load(std::memory_order_relaxed);
+    const u64 io_bytes_cur = g_io_bytes.load(std::memory_order_relaxed);
+    const u64 io_us_cur = g_io_us.load(std::memory_order_relaxed);
+    const u64 detile_cur = g_detile_count.load(std::memory_order_relaxed);
+    const double io_per_s =
+        window_s > 0.0 ? static_cast<double>(io_count_cur - g_io_count_last) / window_s : 0.0;
+    const double io_mb_per_s =
+        window_s > 0.0
+            ? static_cast<double>(io_bytes_cur - g_io_bytes_last) / (1024.0 * 1024.0) / window_s
+            : 0.0;
+    const double io_ms_per_s =
+        window_s > 0.0 ? static_cast<double>(io_us_cur - g_io_us_last) / 1000.0 / window_s : 0.0;
+    const double detile_per_s =
+        window_s > 0.0 ? static_cast<double>(detile_cur - g_detile_last) / window_s : 0.0;
     g_submit_last = submit_cur;
     g_gpuwait_last = gpuwait_cur;
     g_gpubusy_last = gpubusy_cur;
+    g_io_count_last = io_count_cur;
+    g_io_bytes_last = io_bytes_cur;
+    g_io_us_last = io_us_cur;
+    g_detile_last = detile_cur;
 
     // Active phase-parking detection: a tick sitting within kPhaseBandMs of a
     // vblank boundary is one jitter-width away from display-side frame drops.
@@ -199,10 +241,11 @@ void PresentFrame(double interval_ms, double work_ms, double sleep_ms, double ta
     g_series.count += 1;
     std::fprintf(file,
                  "%.2f present n=%d fps=%.1f submit=%.1f worst=%.1f phase=%.2f gpuwait=%.1f "
-                 "gpubusy=%.1f interval=%.2f work=%.2f acquire=%.2f record=%.2f flush=%.2f "
-                 "qpresent=%.2f sleep=%.2f over=%.2f%s\n",
+                 "gpubusy=%.1f io=%.0f ioMB=%.1f ioms=%.1f detile=%.0f interval=%.2f work=%.2f "
+                 "acquire=%.2f record=%.2f flush=%.2f qpresent=%.2f sleep=%.2f over=%.2f%s\n",
                  g_win.clock_ms / 1000.0, g_win.frames, fps, submit_fps, g_win.worst, g_win.phase,
-                 gpuwait_ms, gpubusy_ms, mean_interval, g_win.work / n,
+                 gpuwait_ms, gpubusy_ms, io_per_s, io_mb_per_s, io_ms_per_s, detile_per_s,
+                 mean_interval, g_win.work / n,
                  g_win.stage[static_cast<int>(PresentStage::Acquire)] / n,
                  g_win.stage[static_cast<int>(PresentStage::Record)] / n,
                  g_win.stage[static_cast<int>(PresentStage::Flush)] / n,

@@ -56,6 +56,8 @@ const char* Name(int i) {
         return "imgcreate";
     case StutterCat::GpuWait:
         return "wait";
+    case StutterCat::FileIo:
+        return "fileio";
     default:
         return "?";
     }

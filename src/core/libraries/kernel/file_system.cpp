@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <map>
 #include <ranges>
 #include <magic_enum/magic_enum.hpp>
@@ -8,8 +9,10 @@
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/present_log.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
+#include "common/stutter_log.h"
 #include "core/file_sys/devices/console_device.h"
 #include "core/file_sys/devices/deci_tty6_device.h"
 #include "core/file_sys/devices/logger.h"
@@ -353,12 +356,27 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes) {
 }
 
 s64 ReadFile(Common::FS::IOFile& file, void* buf, u64 nbytes) {
+    // Telemetry: every guest file read funnels through here. Time spent inside
+    // (host I/O + cache invalidation) is charged to the "fileio" stutter
+    // category and the per-second io counters, so a multi-second load freeze
+    // can be split into emulator I/O vs guest-side work (decompression).
+    const bool timed = Common::PresentLogEnabled();
+    const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.
     const auto remaining = file.GetSize() - file.Tell();
     memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
 
-    return file.ReadRaw<u8>(buf, nbytes);
+    const s64 result = file.ReadRaw<u8>(buf, nbytes);
+    if (timed) {
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
+        Common::PresentAddIo(ms, result > 0 ? static_cast<u64>(result) : 0);
+        Common::StutterAdd(Common::StutterCat::FileIo, ms);
+    }
+    return result;
 }
 
 s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
