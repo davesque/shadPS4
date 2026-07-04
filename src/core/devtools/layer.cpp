@@ -452,17 +452,17 @@ void L::Draw() {
             };
             static std::array<ImVec2, Common::PresentSeries::kN> pts;
             for (const Chart& c : charts) {
-                float vmin = std::numeric_limits<float>::max();
-                float vmax = std::numeric_limits<float>::lowest();
+                float raw_min = std::numeric_limits<float>::max();
+                float raw_max = std::numeric_limits<float>::lowest();
                 for (int i = 0; i < window; ++i) {
                     const float v = sample(*c.data, i);
-                    vmin = std::min(vmin, v);
-                    vmax = std::max(vmax, v);
+                    raw_min = std::min(raw_min, v);
+                    raw_max = std::max(raw_max, v);
                 }
                 // Pad the range so a flat series still draws mid-box.
-                const float pad = std::max((vmax - vmin) * 0.10f, 0.5f);
-                vmin -= pad;
-                vmax += pad;
+                const float pad = std::max((raw_max - raw_min) * 0.10f, 0.5f);
+                const float vmin = raw_min - pad;
+                const float vmax = raw_max + pad;
                 const auto to_y = [&](float v) {
                     return y0 + kH - 2.0f - (v - vmin) / (vmax - vmin) * (kH - 4.0f);
                 };
@@ -492,11 +492,15 @@ void L::Draw() {
                                     to_y(sample(*c.data, i))};
                 }
                 dl->AddPolyline(pts.data(), window, c.color, 0, 1.5f);
-                char label[64];
-                std::snprintf(label, sizeof(label), "%s %.1f", c.name,
-                              sample(*c.data, window - 1));
-                dl->AddText(ImVec2{x0 + 5.0f, y0 + 3.0f}, IM_COL32(0, 0, 0, 220), label);
-                dl->AddText(ImVec2{x0 + 4.0f, y0 + 2.0f}, c.color, label);
+                // Metric name above the chart; current value and window
+                // min/max below it, e.g. "60.0 [25.3,60.0]".
+                dl->AddText(ImVec2{x0 + 3.0f, y0 - 15.0f}, IM_COL32(0, 0, 0, 220), c.name);
+                dl->AddText(ImVec2{x0 + 2.0f, y0 - 16.0f}, c.color, c.name);
+                char figures[64];
+                std::snprintf(figures, sizeof(figures), "%.1f [%.1f,%.1f]",
+                              sample(*c.data, window - 1), raw_min, raw_max);
+                dl->AddText(ImVec2{x0 + 3.0f, y0 + kH + 3.0f}, IM_COL32(0, 0, 0, 220), figures);
+                dl->AddText(ImVec2{x0 + 2.0f, y0 + kH + 2.0f}, c.color, figures);
                 x0 += kW + kGap;
             }
             if (o.phase_warn) {
