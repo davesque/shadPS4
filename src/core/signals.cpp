@@ -15,9 +15,9 @@ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 #else
 #include <csignal>
 #include <pthread.h>
+#endif
 #ifdef ARCH_X86_64
 #include <Zydis/Formatter.h>
-#endif
 #endif
 
 #ifndef _WIN32
@@ -29,7 +29,66 @@ extern std::array<OrbisKernelExceptionHandler, 32> Handlers;
 
 namespace Core {
 
+static std::string DisassembleInstruction(void* code_address) {
+    char buffer[256] = "<unable to decode>";
+
+#ifdef ARCH_X86_64
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    const auto status =
+        Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
+    if (ZYAN_SUCCESS(status)) {
+        ZydisFormatter formatter;
+        ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+        ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
+                                        instruction.operand_count_visible, buffer, sizeof(buffer),
+                                        reinterpret_cast<u64>(code_address), ZYAN_NULL);
+    }
+#endif
+
+    return buffer;
+}
+
 #if defined(_WIN32)
+
+// Log everything a post-mortem needs for a guest crash: fault kind, accessed
+// address, register file, and the faulting instruction. Rare wild-jump crashes
+// can't be reproduced on demand, so each occurrence has to carry its own
+// forensics.
+static void LogCrashContext(const EXCEPTION_POINTERS* pExp, DWORD code, PVOID address) {
+    const auto* record = pExp->ExceptionRecord;
+    if (code == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+        const auto kind = record->ExceptionInformation[0];
+        LOG_CRITICAL(Debug, "Access violation: {} address {:#x}",
+                     kind == 0   ? "read from"
+                     : kind == 1 ? "write to"
+                     : kind == 8 ? "execute of non-executable"
+                                 : "unknown access to",
+                     record->ExceptionInformation[1]);
+    }
+#ifdef ARCH_X86_64
+    const auto* ctx = pExp->ContextRecord;
+    if (ctx != nullptr) {
+        LOG_CRITICAL(Debug,
+                     "rip={:#x} rsp={:#x} rbp={:#x}\n"
+                     "rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}\n"
+                     "rsi={:#x} rdi={:#x} r8={:#x} r9={:#x}\n"
+                     "r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                     ctx->Rip, ctx->Rsp, ctx->Rbp, ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx,
+                     ctx->Rsi, ctx->Rdi, ctx->R8, ctx->R9, ctx->R10, ctx->R11, ctx->R12, ctx->R13,
+                     ctx->R14, ctx->R15);
+    }
+#endif
+    // Only try to disassemble memory that is actually mapped and readable.
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_COMMIT &&
+        (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_READONLY |
+                        PAGE_READWRITE | PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY)) != 0) {
+        LOG_CRITICAL(Debug, "Faulting instruction: {}", DisassembleInstruction(address));
+    } else {
+        LOG_CRITICAL(Debug, "Faulting address is not in mapped readable memory");
+    }
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     const auto* signals = Signals::Instance();
@@ -68,6 +127,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     // Breakpoints almost certainly come from our asserts/unreachables, no need to log it again.
     if (code != EXCEPTION_BREAKPOINT) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        LogCrashContext(pExp, code, address);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 
@@ -75,26 +135,6 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
 }
 
 #else
-
-static std::string DisassembleInstruction(void* code_address) {
-    char buffer[256] = "<unable to decode>";
-
-#ifdef ARCH_X86_64
-    ZydisDecodedInstruction instruction;
-    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-    const auto status =
-        Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
-    if (ZYAN_SUCCESS(status)) {
-        ZydisFormatter formatter;
-        ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
-        ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
-                                        instruction.operand_count_visible, buffer, sizeof(buffer),
-                                        reinterpret_cast<u64>(code_address), ZYAN_NULL);
-    }
-#endif
-
-    return buffer;
-}
 
 void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     const auto* signals = Signals::Instance();
