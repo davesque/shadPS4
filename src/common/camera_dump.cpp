@@ -159,11 +159,19 @@ void DumpOnce(std::FILE* file, uintptr_t base, uintptr_t manager, uintptr_t foll
     std::memcpy(&fovy, &fovy_i, sizeof(fovy));
     const u8 enable = Read<u8>(followcam + kEnableOff);
 
+    // The object's vtable pointer is the key that unlocks static RE of
+    // its Update: vtable - eboot_base = the ELF data address whose
+    // slots name every virtual method.
+    const uintptr_t cam_vtable = Read<uintptr_t>(followcam);
+    const uintptr_t mgr_vtable = Read<uintptr_t>(manager);
     std::snprintf(buf, sizeof(buf),
-                  "CAMDUMP === ChrFollowCam @ guest 0x%llx (manager 0x%llx slot +0x%llx, "
-                  "eboot base 0x%llx) FovY=%.5f rad EnableChrFollowCam=%u ===",
+                  "CAMDUMP === ChrFollowCam @ guest 0x%llx vtable 0x%llx (manager 0x%llx "
+                  "vtable 0x%llx slot +0x%llx, eboot base 0x%llx) FovY=%.5f rad "
+                  "EnableChrFollowCam=%u ===",
                   static_cast<unsigned long long>(followcam),
+                  static_cast<unsigned long long>(cam_vtable),
                   static_cast<unsigned long long>(manager),
+                  static_cast<unsigned long long>(mgr_vtable),
                   static_cast<unsigned long long>(g_found_slot),
                   static_cast<unsigned long long>(base), fovy, enable);
     EmitLine(file, buf);
