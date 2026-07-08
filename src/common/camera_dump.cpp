@@ -37,6 +37,8 @@ constexpr int kPollEverySecs = 1;
 constexpr int kRedumpEverySecs = 5;
 
 std::atomic<bool> g_started{false};
+// Manager slot the follow camera was found in (annotation only).
+uintptr_t g_found_slot = 0;
 
 // Read a POD value from a host address. shadPS4 maps guest memory 1:1 into the
 // host process, and MemoryPatcher::g_eboot_address is already a directly
@@ -87,8 +89,9 @@ std::FILE* OpenDumpFile() {
 // invalid. Only dereferences pointers gated by a preceding non-null check and,
 // for the manager, a vtable match, so an uninitialized (zero) chain is skipped
 // rather than followed into garbage.
-uintptr_t ResolveFollowCam(uintptr_t base, uintptr_t& manager_out) {
+uintptr_t ResolveFollowCam(uintptr_t base, uintptr_t& manager_out, uintptr_t& slot_out) {
     manager_out = 0;
+    slot_out = 0;
     if (base == 0) {
         return 0;
     }
@@ -100,17 +103,40 @@ uintptr_t ResolveFollowCam(uintptr_t base, uintptr_t& manager_out) {
     if (manager < 0x10000) {
         return 0;
     }
-    // Strong validation: the manager's vtable pointer must be the known eboot
-    // address. This guarantees we have the right object before reading further.
-    if (Read<uintptr_t>(manager) != base + kManagerVtable) {
+    // The live object's vtable turned out not to match the one the Init
+    // disassembly predicted (a related class constructs here), so exact
+    // equality was wrong. Require only that the vtable points into the
+    // eboot image, then validate the sub-camera BY CONTENT below.
+    const uintptr_t vtable = Read<uintptr_t>(manager);
+    if (vtable < base || vtable > base + 0x10000000) {
         return 0;
     }
     manager_out = manager;
-    const uintptr_t followcam = Read<uintptr_t>(manager + kMgrToFollowCam);
-    if (followcam < 0x10000) {
-        return 0;
+    // Probe the manager's pointer slots for the follow camera: the right
+    // object carries FovY = 0.7505 rad (43 deg, LockCamParam-verified) at
+    // +0x50. Prefer the predicted slot (+0x60), then scan neighbors.
+    auto plausible = [&](uintptr_t cand) -> bool {
+        if (cand < 0x10000) {
+            return false;
+        }
+        const u32 raw = Read<u32>(cand + kFovYOff);
+        float fovy;
+        std::memcpy(&fovy, &raw, sizeof(fovy));
+        return fovy > 0.5f && fovy < 1.2f;
+    };
+    const uintptr_t predicted = Read<uintptr_t>(manager + kMgrToFollowCam);
+    if (plausible(predicted)) {
+        slot_out = kMgrToFollowCam;
+        return predicted;
     }
-    return followcam;
+    for (uintptr_t off = 0x40; off < 0x100; off += 8) {
+        const uintptr_t cand = Read<uintptr_t>(manager + off);
+        if (plausible(cand)) {
+            slot_out = off;
+            return cand;
+        }
+    }
+    return 0;
 }
 
 void EmitLine(std::FILE* file, const char* line) {
@@ -134,10 +160,11 @@ void DumpOnce(std::FILE* file, uintptr_t base, uintptr_t manager, uintptr_t foll
     const u8 enable = Read<u8>(followcam + kEnableOff);
 
     std::snprintf(buf, sizeof(buf),
-                  "CAMDUMP === ChrFollowCam @ guest 0x%llx (manager 0x%llx, eboot base 0x%llx) "
-                  "FovY=%.5f rad EnableChrFollowCam=%u ===",
+                  "CAMDUMP === ChrFollowCam @ guest 0x%llx (manager 0x%llx slot +0x%llx, "
+                  "eboot base 0x%llx) FovY=%.5f rad EnableChrFollowCam=%u ===",
                   static_cast<unsigned long long>(followcam),
                   static_cast<unsigned long long>(manager),
+                  static_cast<unsigned long long>(g_found_slot),
                   static_cast<unsigned long long>(base), fovy, enable);
     EmitLine(file, buf);
 
@@ -183,7 +210,9 @@ void PollLoop(std::FILE* file) {
     int waited = 0;
     while (true) {
         uintptr_t manager = 0;
-        const uintptr_t followcam = ResolveFollowCam(base, manager);
+        uintptr_t slot = 0;
+        const uintptr_t followcam = ResolveFollowCam(base, manager, slot);
+        g_found_slot = slot;
         if (followcam != 0) {
             since_dump += kPollEverySecs;
             if (since_dump >= kRedumpEverySecs) {
