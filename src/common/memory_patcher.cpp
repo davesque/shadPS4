@@ -8,6 +8,7 @@
 #include <string>
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
+#include "common/camera_dump.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -245,6 +246,11 @@ void OnGameLoaded() {
         }
     }
     ApplyPendingPatches();
+
+    // Dev-only: start the Bloodborne camera-config dumper. No-op unless the
+    // SHAD_CAMERA_DUMP environment variable names an output file. g_eboot_address
+    // is set by now, which the poller needs to resolve the guest camera manager.
+    Common::StartCameraDump();
 }
 
 void AddPatchToQueue(const patchInfo& patchToAdd) {

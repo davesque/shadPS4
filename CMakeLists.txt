@@ -804,6 +804,8 @@ set(COMMON src/common/logging/classes.h
            src/common/string_literal.h
            src/common/string_util.cpp
            src/common/string_util.h
+           src/common/camera_dump.cpp
+           src/common/camera_dump.h
            src/common/stutter_log.cpp
            src/common/stutter_log.h
            src/common/present_log.cpp
