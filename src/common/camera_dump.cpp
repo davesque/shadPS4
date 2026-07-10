@@ -84,13 +84,53 @@ T Read(uintptr_t host_addr) {
     return v;
 }
 
-// Access-violation-guarded read. The camera chain is validated link by link,
-// but resolving the PLAYER means chasing pointers whose targets may not be
-// committed (WorldChrMan's manager holds sparse slots). A wild deref would
-// crash the game mid-session; SEH turns it into a clean false so the poller
-// keeps running. POD-only body (no C++ unwinding inside __try).
+// Probe whether [addr, addr+n) is entirely committed and readable WITHOUT
+// touching it. This is the real guard. shadPS4 installs a vectored exception
+// handler for guest memory (signals.cpp) that intercepts access violations
+// before any frame-based SEH __except can run -- confirmed by a crash reading
+// guest 0x500000000 that was reported as "Unhandled Exception" despite the
+// __try below. So a wild deref cannot be caught after it faults; it must be
+// avoided. The player probe chases pointers whose targets may be
+// reserved-but-uncommitted (the manager holds sparse slots and stale/garbage
+// values), so every speculative read is gated on this first.
+bool IsReadable(uintptr_t addr, size_t n) {
+#ifdef _WIN32
+    uintptr_t cur = addr;
+    const uintptr_t end = addr + n;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT) {
+            return false; // reserved / free -> reading faults
+        }
+        constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                    PAGE_EXECUTE_WRITECOPY;
+        if ((mbi.Protect & kReadable) == 0 ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+            return false;
+        }
+        cur = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+#else
+    (void)addr;
+    (void)n;
+    return true;
+#endif
+}
+
+// Guarded read: never fault. IsReadable rejects unmapped / guarded ranges up
+// front (the only reliable protection given shadPS4's vectored handler); the
+// __try is a harmless second line for a race between the probe and the copy.
+// POD-only body (no C++ unwinding inside __try).
 bool SafeReadBytes(uintptr_t addr, void* out, size_t n) {
 #ifdef _WIN32
+    if (!IsReadable(addr, n)) {
+        return false;
+    }
     __try {
         std::memcpy(out, reinterpret_cast<const void*>(addr), n);
         return true;
@@ -181,42 +221,48 @@ uintptr_t ResolveFollowCam(uintptr_t base, uintptr_t& manager_out, uintptr_t& sl
     if (base == 0) {
         return 0;
     }
-    const uintptr_t container = Read<uintptr_t>(base + kContainerGlobal);
-    if (container < 0x10000) {
+    uintptr_t container = 0;
+    if (!SafeRead(base + kContainerGlobal, container) || container < 0x10000) {
         return 0; // not constructed yet (0) or implausible
     }
-    const uintptr_t manager = Read<uintptr_t>(container + kContainerToMgr);
-    if (manager < 0x10000) {
+    uintptr_t manager = 0;
+    if (!SafeRead(container + kContainerToMgr, manager) || manager < 0x10000) {
         return 0;
     }
     // The live object's vtable turned out not to match the one the Init
     // disassembly predicted (a related class constructs here), so exact
     // equality was wrong. Require only that the vtable points into the
     // eboot image, then validate the sub-camera BY CONTENT below.
-    const uintptr_t vtable = Read<uintptr_t>(manager);
-    if (vtable < base || vtable > base + 0x10000000) {
+    uintptr_t vtable = 0;
+    if (!SafeRead(manager, vtable) || vtable < base || vtable > base + 0x10000000) {
         return 0;
     }
     manager_out = manager;
     // Probe the manager's pointer slots for the follow camera: the right
     // object carries FovY = 0.7505 rad (43 deg, LockCamParam-verified) at
-    // +0x50. Prefer the predicted slot (+0x60), then scan neighbors.
+    // +0x50. Prefer the predicted slot (+0x60), then scan neighbors. Each slot
+    // value is an unvalidated pointer, so read through the guard.
     auto plausible = [&](uintptr_t cand) -> bool {
         if (cand < 0x10000) {
             return false;
         }
-        const u32 raw = Read<u32>(cand + kFovYOff);
+        u32 raw = 0;
+        if (!SafeRead(cand + kFovYOff, raw)) {
+            return false;
+        }
         float fovy;
         std::memcpy(&fovy, &raw, sizeof(fovy));
         return fovy > 0.5f && fovy < 1.2f;
     };
-    const uintptr_t predicted = Read<uintptr_t>(manager + kMgrToFollowCam);
+    uintptr_t predicted = 0;
+    SafeRead(manager + kMgrToFollowCam, predicted);
     if (plausible(predicted)) {
         slot_out = kMgrToFollowCam;
         return predicted;
     }
     for (uintptr_t off = 0x40; off < 0x100; off += 8) {
-        const uintptr_t cand = Read<uintptr_t>(manager + off);
+        uintptr_t cand = 0;
+        SafeRead(manager + off, cand);
         if (plausible(cand)) {
             slot_out = off;
             return cand;
@@ -434,10 +480,16 @@ void PollLoop(std::FILE* file) {
             // yet constructed, manager slot empty, vtable mismatch).
             if (waited % 10 == 0) {
                 char buf[256];
-                const uintptr_t container = Read<uintptr_t>(base + kContainerGlobal);
-                const uintptr_t mgr =
-                    container >= 0x10000 ? Read<uintptr_t>(container + kContainerToMgr) : 0;
-                const uintptr_t vtbl = mgr >= 0x10000 ? Read<uintptr_t>(mgr) : 0;
+                uintptr_t container = 0;
+                SafeRead(base + kContainerGlobal, container);
+                uintptr_t mgr = 0;
+                if (container >= 0x10000) {
+                    SafeRead(container + kContainerToMgr, mgr);
+                }
+                uintptr_t vtbl = 0;
+                if (mgr >= 0x10000) {
+                    SafeRead(mgr, vtbl);
+                }
                 std::snprintf(buf, sizeof(buf),
                               "CAMDUMP waiting: container=0x%llx manager=0x%llx vtable=0x%llx "
                               "(expect 0x%llx)",
