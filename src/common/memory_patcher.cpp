@@ -247,9 +247,10 @@ void OnGameLoaded() {
     }
     ApplyPendingPatches();
 
-    // Dev-only: start the Bloodborne camera-config dumper. No-op unless the
-    // SHAD_CAMERA_DUMP environment variable names an output file. g_eboot_address
-    // is set by now, which the poller needs to resolve the guest camera manager.
+    // Dev-only: start the Bloodborne camera+player dumper. Writes bb_camera_dump.txt
+    // next to the executable by default (SHAD_CAMERA_DUMP overrides the path).
+    // g_eboot_address is set by now, which the poller needs to resolve the guest
+    // camera manager.
     Common::StartCameraDump();
 }
 

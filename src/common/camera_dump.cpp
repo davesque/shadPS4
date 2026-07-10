@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 
 #ifdef _WIN32
@@ -139,12 +140,35 @@ const char* FieldName(uintptr_t off) {
     }
 }
 
-std::FILE* OpenDumpFile() {
-    const char* p = std::getenv("SHAD_CAMERA_DUMP");
-    if (p == nullptr || *p == '\0') {
-        return nullptr;
+// Where the dump lands when SHAD_CAMERA_DUMP is unset: a file next to the
+// running executable. This makes the capture work from a launcher that can't
+// set environment variables (BB Launcher) with zero per-machine config, while
+// the env var still wins when present so output can be redirected.
+std::string DefaultDumpPath() {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        std::string path(buf, n);
+        const size_t slash = path.find_last_of("\\/");
+        if (slash != std::string::npos) {
+            path.resize(slash + 1);
+            path += "bb_camera_dump.txt";
+            return path;
+        }
     }
-    return std::fopen(p, "w");
+#endif
+    return "bb_camera_dump.txt"; // fallback: current working directory
+}
+
+std::FILE* OpenDumpFile(std::string& path_out) {
+    const char* p = std::getenv("SHAD_CAMERA_DUMP");
+    if (p != nullptr && *p != '\0') {
+        path_out = p;
+    } else {
+        path_out = DefaultDumpPath();
+    }
+    return std::fopen(path_out.c_str(), "w");
 }
 
 // Resolve the live ChrFollowCam guest address, or 0 if not yet available /
@@ -432,15 +456,19 @@ void PollLoop(std::FILE* file) {
 } // namespace
 
 void StartCameraDump() {
-    std::FILE* file = OpenDumpFile();
-    if (file == nullptr) {
-        return; // SHAD_CAMERA_DUMP unset -> complete no-op
-    }
+    // Claim the singleton first: opening with "w" truncates, so a re-entrant
+    // call must not reopen the file the running poller already holds.
     if (g_started.exchange(true)) {
-        std::fclose(file);
         return; // already running
     }
-    LOG_INFO(Loader, "SHAD_CAMERA_DUMP set: starting Bloodborne camera-struct dumper");
+    std::string path;
+    std::FILE* file = OpenDumpFile(path);
+    if (file == nullptr) {
+        LOG_WARNING(Loader, "Bloodborne camera dumper: could not open '{}'", path);
+        g_started.store(false); // let a later game-load retry
+        return;
+    }
+    LOG_INFO(Loader, "Bloodborne camera+player dumper active -> {}", path);
     std::thread(PollLoop, file).detach();
 }
 
