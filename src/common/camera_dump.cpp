@@ -52,6 +52,15 @@ constexpr uintptr_t kDumpEnd = 0x300;
 constexpr uintptr_t kWorldChrManGlobal = 0x553e878; // *(base+this) = WorldChrMan
 constexpr uintptr_t kWcmToChrManager = 0x60;        // WorldChrMan[0xc] = ChrManager
 constexpr uintptr_t kPivotOff = 0x90;               // followcam pivot (player pos proxy)
+// ChrManager+0x60 is the local player ChrIns (runtime-confirmed: that slot held
+// the vtable-0x5370430 object whose destructors write that vtable). Its world
+// transform is a 4x4 at +0x180 (right +0x180, up +0x190, forward +0x1a0,
+// translation +0x1b0), so the forward vector at +0x1a0 is the character's
+// facing. Dump +0x140..+0x220 each snapshot to pin the facing/velocity fields.
+constexpr uintptr_t kMgrToPlayer = 0x60;
+constexpr uintptr_t kPlayerVtableElf = 0x5370430;
+constexpr uintptr_t kXformBegin = 0x140;
+constexpr uintptr_t kXformEnd = 0x220;
 // How far a candidate object's position may sit from the pivot and still count
 // as "the player", meters. The pivot chases the player at 0.1/tick so it trails
 // by up to ~1 m under sprint; 3 m is a safe, still-discriminating window.
@@ -176,6 +185,22 @@ const char* FieldName(uintptr_t off) {
     case 0x1f8: return "RotRangeAtLockMinX";
     case 0x1fc: return "Begin";
     case 0x200: return "End";
+    default: return nullptr;
+    }
+}
+
+// Labels for the hypothesized player world-transform 4x4 (column-major) so the
+// dump is readable at a glance; unlabeled offsets print raw for magnitude match.
+const char* XformTag(uintptr_t off) {
+    switch (off) {
+    case 0x180: return "right.x";
+    case 0x190: return "up.x";
+    case 0x1a0: return "fwd.x (facing)";
+    case 0x1a4: return "fwd.y";
+    case 0x1a8: return "fwd.z (facing)";
+    case 0x1b0: return "pos.x";
+    case 0x1b4: return "pos.y";
+    case 0x1b8: return "pos.z";
     default: return nullptr;
     }
 }
@@ -361,6 +386,42 @@ void DumpPlayer(std::FILE* file, uintptr_t base, uintptr_t followcam) {
                   static_cast<unsigned long long>(mgr_vt),
                   static_cast<unsigned long long>(mgr_vt >= base ? mgr_vt - base : 0));
     EmitLine(file, buf);
+
+    // Focused local-player transform dump: the authoritative facing/position
+    // source, read straight from ChrManager+0x60 (no position-match guessing).
+    // Across snapshots at different headings, the facing floats rotate while
+    // position tracks the walk, which pins the turn behavior for the RE.
+    uintptr_t player = 0;
+    SafeRead(mgr + kMgrToPlayer, player);
+    if (IsHeapPtr(player, base)) {
+        uintptr_t pvt = 0;
+        SafeRead(player, pvt);
+        const bool match = (pvt == base + kPlayerVtableElf);
+        std::snprintf(buf, sizeof(buf),
+                      "CAMDUMP PLAYER obj 0x%llx vtable 0x%llx (ELF 0x%llx) %s",
+                      static_cast<unsigned long long>(player),
+                      static_cast<unsigned long long>(pvt),
+                      static_cast<unsigned long long>(pvt >= base ? pvt - base : 0),
+                      match ? "[vtable MATCH]" : "[vtable mismatch]");
+        EmitLine(file, buf);
+        for (uintptr_t off = kXformBegin; off < kXformEnd; off += 4) {
+            u32 raw = 0;
+            if (!SafeRead(player + off, raw)) {
+                continue;
+            }
+            float f;
+            std::memcpy(&f, &raw, sizeof(f));
+            const char* tag = XformTag(off);
+            if (tag != nullptr) {
+                std::snprintf(buf, sizeof(buf), "CAMDUMP   PLR +0x%03llx = %11.5f  [%s]",
+                              static_cast<unsigned long long>(off), f, tag);
+            } else {
+                std::snprintf(buf, sizeof(buf), "CAMDUMP   PLR +0x%03llx = %11.5f",
+                              static_cast<unsigned long long>(off), f);
+            }
+            EmitLine(file, buf);
+        }
+    }
 
     // Raw layout windows (u64) for offline analysis of where the player hangs.
     for (uintptr_t off = 0; off < kWcmWindow; off += 8) {
