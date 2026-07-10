@@ -9,6 +9,16 @@
 #include <cstring>
 #include <thread>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "common/camera_dump.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
@@ -30,6 +40,27 @@ constexpr uintptr_t kEnableOff = 0x342;      // byte, EnableChrFollowCam
 constexpr uintptr_t kDumpBegin = 0x100;
 constexpr uintptr_t kDumpEnd = 0x300;
 
+// --- Player resolution (for movement/turn RE) --------------------------------
+// WorldChrMan is a named FD4 singleton (the camera-manager step asserts the
+// name "WorldChrMan" on the global at ELF 0x553e878). Its +0x60 slot is the
+// character manager, which exposes the local player through a virtual
+// GetLocalPlayer (manager_vtable+0x560/+0x598). We can't follow that virtual
+// call statically, so dump the manager's vtable (to decompile the getter) and
+// locate the player object at runtime by matching its world position to the
+// camera pivot (followcam+0x90).
+constexpr uintptr_t kWorldChrManGlobal = 0x553e878; // *(base+this) = WorldChrMan
+constexpr uintptr_t kWcmToChrManager = 0x60;        // WorldChrMan[0xc] = ChrManager
+constexpr uintptr_t kPivotOff = 0x90;               // followcam pivot (player pos proxy)
+// How far a candidate object's position may sit from the pivot and still count
+// as "the player", meters. The pivot chases the player at 0.1/tick so it trails
+// by up to ~1 m under sprint; 3 m is a safe, still-discriminating window.
+constexpr float kPosMatchM = 3.0f;
+// Windows of WorldChrMan / manager to snapshot as raw u64 for offline layout
+// analysis, and the span of a candidate object to scan for a position match.
+constexpr uintptr_t kWcmWindow = 0x100;
+constexpr uintptr_t kMgrWindow = 0x400;
+constexpr uintptr_t kCandScan = 0x600;
+
 // Poll cadence. First valid resolution dumps immediately; then we re-dump every
 // kRedumpEverySecs so values that settle after boot (or are live-tuned) land in
 // the log. Cheap (129 reads + fprintf) so the periodic re-dump is negligible.
@@ -50,6 +81,37 @@ T Read(uintptr_t host_addr) {
     T v{};
     std::memcpy(&v, reinterpret_cast<const void*>(host_addr), sizeof(T));
     return v;
+}
+
+// Access-violation-guarded read. The camera chain is validated link by link,
+// but resolving the PLAYER means chasing pointers whose targets may not be
+// committed (WorldChrMan's manager holds sparse slots). A wild deref would
+// crash the game mid-session; SEH turns it into a clean false so the poller
+// keeps running. POD-only body (no C++ unwinding inside __try).
+bool SafeReadBytes(uintptr_t addr, void* out, size_t n) {
+#ifdef _WIN32
+    __try {
+        std::memcpy(out, reinterpret_cast<const void*>(addr), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    std::memcpy(out, reinterpret_cast<const void*>(addr), n);
+    return true;
+#endif
+}
+
+template <typename T>
+bool SafeRead(uintptr_t addr, T& out) {
+    return SafeReadBytes(addr, &out, sizeof(T));
+}
+
+// A value that looks like a live heap object pointer: guest heap sits below
+// the eboot base (the camera resolved at guest 0x226c86450, base 0x800000000)
+// and well above the low reserved range.
+bool IsHeapPtr(uintptr_t v, uintptr_t base) {
+    return v >= 0x100000000ull && v < base;
 }
 
 // Human-readable names for the individually-mapped offsets (from
@@ -151,6 +213,120 @@ void EmitLine(std::FILE* file, const char* line) {
     LOG_INFO(Loader, "{}", line);
 }
 
+// Read three consecutive floats as a position.
+struct Vec3f {
+    float x, y, z;
+};
+
+bool NearPivot(const Vec3f& p, const Vec3f& pivot) {
+    auto ok = [](float a, float b) {
+        const float d = a - b;
+        return d > -kPosMatchM && d < kPosMatchM;
+    };
+    // Reject garbage: coordinates in a sane world range.
+    auto sane = [](float a) { return a > -100000.0f && a < 100000.0f; };
+    return sane(p.x) && sane(p.y) && sane(p.z) && ok(p.x, pivot.x) && ok(p.y, pivot.y) &&
+           ok(p.z, pivot.z);
+}
+
+// Scan one candidate object's first kCandScan bytes for a float-triple that
+// matches the pivot, and log the object + vtable + offset if found. Returns
+// true on a match. All reads guarded, so a bad candidate is harmless.
+bool ScanCandidate(std::FILE* file, uintptr_t base, uintptr_t cand, const Vec3f& pivot,
+                   const char* origin) {
+    if (!IsHeapPtr(cand, base)) {
+        return false;
+    }
+    static thread_local unsigned char win[kCandScan];
+    if (!SafeReadBytes(cand, win, sizeof(win))) {
+        return false;
+    }
+    for (uintptr_t off = 0; off + sizeof(Vec3f) <= sizeof(win); off += 4) {
+        Vec3f p;
+        std::memcpy(&p, win + off, sizeof(p));
+        if (NearPivot(p, pivot)) {
+            uintptr_t vt = 0;
+            std::memcpy(&vt, win, sizeof(vt));
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "CAMDUMP PLAYER? obj 0x%llx (from %s) pos@+0x%llx = (%.3f, %.3f, %.3f) "
+                          "vtable 0x%llx (ELF 0x%llx)",
+                          static_cast<unsigned long long>(cand), origin,
+                          static_cast<unsigned long long>(off), p.x, p.y, p.z,
+                          static_cast<unsigned long long>(vt),
+                          static_cast<unsigned long long>(vt >= base ? vt - base : 0));
+            EmitLine(file, buf);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Resolve WorldChrMan + the character manager, dump the manager vtable (static
+// RE anchor for GetLocalPlayer) and raw layout windows, and try to locate the
+// player object by position-matching the camera pivot.
+void DumpPlayer(std::FILE* file, uintptr_t base, uintptr_t followcam) {
+    char buf[256];
+    Vec3f pivot{};
+    SafeReadBytes(followcam + kPivotOff, &pivot, sizeof(pivot));
+    std::snprintf(buf, sizeof(buf), "CAMDUMP --- player probe: pivot (%.3f, %.3f, %.3f) ---",
+                  pivot.x, pivot.y, pivot.z);
+    EmitLine(file, buf);
+
+    uintptr_t wcm = 0;
+    if (!SafeRead(base + kWorldChrManGlobal, wcm) || !IsHeapPtr(wcm, base)) {
+        EmitLine(file, "CAMDUMP player: WorldChrMan not resolved yet");
+        return;
+    }
+    uintptr_t mgr = 0;
+    SafeRead(wcm + kWcmToChrManager, mgr);
+    uintptr_t mgr_vt = 0;
+    if (IsHeapPtr(mgr, base)) {
+        SafeRead(mgr, mgr_vt);
+    }
+    std::snprintf(buf, sizeof(buf),
+                  "CAMDUMP WorldChrMan 0x%llx  ChrManager(+0x60) 0x%llx  mgr vtable 0x%llx "
+                  "(ELF 0x%llx)",
+                  static_cast<unsigned long long>(wcm), static_cast<unsigned long long>(mgr),
+                  static_cast<unsigned long long>(mgr_vt),
+                  static_cast<unsigned long long>(mgr_vt >= base ? mgr_vt - base : 0));
+    EmitLine(file, buf);
+
+    // Raw layout windows (u64) for offline analysis of where the player hangs.
+    for (uintptr_t off = 0; off < kWcmWindow; off += 8) {
+        uintptr_t v = 0;
+        if (SafeRead(wcm + off, v) && v != 0) {
+            std::snprintf(buf, sizeof(buf), "CAMDUMP   WCM +0x%03llx = 0x%llx%s",
+                          static_cast<unsigned long long>(off), static_cast<unsigned long long>(v),
+                          IsHeapPtr(v, base) ? "  [heap]" : "");
+            EmitLine(file, buf);
+        }
+    }
+    // Position-match scan over WorldChrMan and the manager's pointer slots.
+    bool found = false;
+    for (uintptr_t off = 0; off < kWcmWindow && !found; off += 8) {
+        uintptr_t v = 0;
+        if (SafeRead(wcm + off, v)) {
+            found = ScanCandidate(file, base, v, pivot, "WCM slot");
+        }
+    }
+    if (IsHeapPtr(mgr, base)) {
+        for (uintptr_t off = 0; off < kMgrWindow; off += 8) {
+            uintptr_t v = 0;
+            if (SafeRead(mgr + off, v)) {
+                std::snprintf(buf, sizeof(buf), "CAMDUMP   MGR +0x%03llx = 0x%llx%s",
+                              static_cast<unsigned long long>(off),
+                              static_cast<unsigned long long>(v),
+                              IsHeapPtr(v, base) ? "  [heap]" : "");
+                if (v != 0) {
+                    EmitLine(file, buf);
+                }
+                ScanCandidate(file, base, v, pivot, "MGR slot");
+            }
+        }
+    }
+}
+
 void DumpOnce(std::FILE* file, uintptr_t base, uintptr_t manager, uintptr_t followcam) {
     char buf[256];
 
@@ -190,6 +366,7 @@ void DumpOnce(std::FILE* file, uintptr_t base, uintptr_t manager, uintptr_t foll
         }
         EmitLine(file, buf);
     }
+    DumpPlayer(file, base, followcam);
     if (file != nullptr) {
         std::fflush(file);
     }
