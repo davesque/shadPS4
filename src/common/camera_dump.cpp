@@ -18,6 +18,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 #include "common/camera_dump.h"
@@ -357,6 +358,149 @@ bool ScanCandidate(std::FILE* file, uintptr_t base, uintptr_t cand, const Vec3f&
     return false;
 }
 
+// --- Heading-writer watchpoint (pure-static RE enabler) ----------------------
+// The ChrIns target-heading field is player+0x54 (committed to facing +0x17c by
+// FUN_01526750). Its writer -- the turn/steering code -- is invoked through the
+// engine's callback dispatch, so static call-graph tracing can't reach it, and
+// the offset is overloaded across dozens of classes so a field-scan only finds
+// false positives. A hardware DATA WRITE watchpoint pinpoints it exactly: set
+// DR0 on player+0x54 (and DR1 on player+0x17c as a mechanism sanity-check, since
+// FUN_01526750 is a KNOWN +0x17c writer) on every thread; a write raises #DB and
+// a vectored handler logs the faulting guest RIP. RIP - eboot_base = the ELF
+// vaddr of the exact writing instruction = the function to decompile. PS4 code
+// runs as native host x86-64, so the guest write is a real host instruction and
+// the debug registers trap it directly.
+#ifdef _WIN32
+std::atomic<bool> g_watch_installed{false};
+uintptr_t g_watch_base = 0;
+HANDLE g_watch_log = INVALID_HANDLE_VALUE;
+std::atomic_flag g_watch_lock = ATOMIC_FLAG_INIT;
+constexpr int kMaxWatchRips = 64;
+uintptr_t g_watch_seen[kMaxWatchRips];
+int g_watch_seen_n = 0;
+
+void WatchWrite(const char* s, int n) {
+    if (g_watch_log != INVALID_HANDLE_VALUE && n > 0) {
+        DWORD wrote = 0;
+        WriteFile(g_watch_log, s, static_cast<DWORD>(n), &wrote, nullptr);
+    }
+}
+
+// Vectored handler: on a hardware data #DB, log the distinct writing RIP.
+// Minimal + POD only (runs in exception context on arbitrary threads).
+LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    CONTEXT* ctx = ep->ContextRecord;
+    const DWORD64 dr6 = ctx->Dr6;
+    if ((dr6 & 0xf) == 0) {
+        return EXCEPTION_CONTINUE_SEARCH; // not one of our data breakpoints
+    }
+    const int which = (dr6 & 0x1) ? 0 : (dr6 & 0x2) ? 1 : (dr6 & 0x4) ? 2 : 3;
+    const uintptr_t rip = static_cast<uintptr_t>(ctx->Rip);
+    const uintptr_t elf = (rip >= g_watch_base) ? rip - g_watch_base : rip;
+    const uintptr_t key = (static_cast<uintptr_t>(which) << 60) ^ elf;
+    bool is_new = false;
+    while (g_watch_lock.test_and_set(std::memory_order_acquire)) {
+    }
+    bool seen = false;
+    for (int i = 0; i < g_watch_seen_n; ++i) {
+        if (g_watch_seen[i] == key) {
+            seen = true;
+            break;
+        }
+    }
+    if (!seen && g_watch_seen_n < kMaxWatchRips) {
+        g_watch_seen[g_watch_seen_n++] = key;
+        is_new = true;
+    }
+    g_watch_lock.clear(std::memory_order_release);
+    if (is_new) {
+        char buf[192];
+        const int n = std::snprintf(
+            buf, sizeof(buf), "WATCH dr%d (%s) writer ELF 0x%llx  (rip 0x%llx)\n", which,
+            which == 0 ? "player+0x54 target-heading" : which == 1 ? "player+0x17c facing" : "?",
+            static_cast<unsigned long long>(elf), static_cast<unsigned long long>(rip));
+        WatchWrite(buf, n);
+    }
+    ctx->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Set DR0=a0 / DR1=a1 as 4-byte WRITE watchpoints on every thread but this one.
+void SetHwWatchAllThreads(uintptr_t a0, uintptr_t a1) {
+    const DWORD pid = GetCurrentProcessId();
+    const DWORD self = GetCurrentThreadId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) {
+                continue;
+            }
+            HANDLE th = OpenThread(
+                THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE,
+                te.th32ThreadID);
+            if (th == nullptr) {
+                continue;
+            }
+            SuspendThread(th);
+            CONTEXT ctx;
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(th, &ctx)) {
+                ctx.Dr0 = a0;
+                ctx.Dr1 = a1;
+                // L0+L1 enable; RW=01 (write), LEN=11 (4 bytes) for slots 0 and 1.
+                DWORD64 dr7 = ctx.Dr7 & ~0x00ff000full;
+                dr7 |= (1ull << 0) | (1ull << 2);
+                dr7 |= (0b01ull << 16) | (0b11ull << 18);
+                dr7 |= (0b01ull << 20) | (0b11ull << 22);
+                ctx.Dr7 = dr7;
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                SetThreadContext(th, &ctx);
+            }
+            ResumeThread(th);
+            CloseHandle(th);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+}
+
+void InstallHeadingWatch(std::FILE* file, uintptr_t base, uintptr_t player) {
+    if (g_watch_installed.exchange(true)) {
+        return;
+    }
+    g_watch_base = base;
+    char path[MAX_PATH];
+    const DWORD pn = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    std::string p = (pn > 0 && pn < MAX_PATH) ? std::string(path, pn) : std::string();
+    const size_t slash = p.find_last_of("\\/");
+    p = (slash != std::string::npos) ? p.substr(0, slash + 1) : std::string();
+    p += "heading_watch.txt";
+    g_watch_log = CreateFileA(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    WatchWrite("# heading_watch: distinct RIPs of instructions that WRITE the watched fields\n", 76);
+    AddVectoredExceptionHandler(1, WatchVeh);
+    const uintptr_t a54 = player + 0x54;
+    const uintptr_t a17c = player + 0x17c;
+    SetHwWatchAllThreads(a54, a17c);
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "CAMDUMP heading watch armed: DR0=player+0x54 (0x%llx), DR1=player+0x17c "
+                  "(0x%llx); writer RIPs -> %s",
+                  static_cast<unsigned long long>(a54), static_cast<unsigned long long>(a17c),
+                  p.c_str());
+    EmitLine(file, buf);
+}
+#else
+void InstallHeadingWatch(std::FILE*, uintptr_t, uintptr_t) {}
+#endif
+
 // Resolve WorldChrMan + the character manager, dump the manager vtable (static
 // RE anchor for GetLocalPlayer) and raw layout windows, and try to locate the
 // player object by position-matching the camera pivot.
@@ -404,6 +548,11 @@ void DumpPlayer(std::FILE* file, uintptr_t base, uintptr_t followcam) {
                       static_cast<unsigned long long>(pvt >= base ? pvt - base : 0),
                       match ? "[vtable MATCH]" : "[vtable mismatch]");
         EmitLine(file, buf);
+        // Arm the hardware write-watchpoint on the confirmed player once, to
+        // catch the dispatched turn code that writes the target heading.
+        if (match) {
+            InstallHeadingWatch(file, base, player);
+        }
         for (uintptr_t off = kXformBegin; off < kXformEnd; off += 4) {
             u32 raw = 0;
             if (!SafeRead(player + off, raw)) {
