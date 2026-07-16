@@ -85,12 +85,16 @@ constexpr int kRedumpEverySecs = 5;
 // at a high rate to a CSV so a controlled two-phase maneuver (turn the character
 // with the camera held still, then pan the camera with the character held still)
 // reveals offline which field tracks the character vs the camera.
-constexpr uintptr_t kFieldWindow = 0x500; // bytes of the player object to sample
-constexpr int kFieldHz = 30;              // sampler rate
-// Arm the +0x54/+0x17c write-watchpoint. Off for the field-hunt capture: those
-// writers are already known (camera step / FUN_01526750) and the debug-register
-// traps only add overhead now.
-constexpr bool kArmHeadingWatch = false;
+// Round 1 found the facing: player+0x34 = the character's true world-facing angle
+// (radians). Round 2 narrows the window (0x34 + 0x54 both fit under 0x200) and
+// samples FAST so the +0x34 staircase reveals the game-LOGIC frame period (step
+// ~16.7 ms => 60 fps, ~33.3 ms => 30 fps) and the peak turn slew is not aliased.
+constexpr uintptr_t kFieldWindow = 0x200; // bytes of the player object to sample
+constexpr int kFieldHz = 150;             // sampler rate (oversample vs 60 fps logic)
+// Arm the write-watchpoint, now pointed at the true facing field (see
+// InstallHeadingWatch). On for round 2 to catch the +0x34 writer = the real
+// turn/steering code.
+constexpr bool kArmHeadingWatch = true;
 
 std::atomic<bool> g_started{false};
 // Manager slot the follow camera was found in (annotation only).
@@ -379,18 +383,18 @@ bool ScanCandidate(std::FILE* file, uintptr_t base, uintptr_t cand, const Vec3f&
     return false;
 }
 
-// --- Heading-writer watchpoint (pure-static RE enabler) ----------------------
-// The ChrIns target-heading field is player+0x54 (committed to facing +0x17c by
-// FUN_01526750). Its writer -- the turn/steering code -- is invoked through the
-// engine's callback dispatch, so static call-graph tracing can't reach it, and
-// the offset is overloaded across dozens of classes so a field-scan only finds
-// false positives. A hardware DATA WRITE watchpoint pinpoints it exactly: set
-// DR0 on player+0x54 (and DR1 on player+0x17c as a mechanism sanity-check, since
-// FUN_01526750 is a KNOWN +0x17c writer) on every thread; a write raises #DB and
-// a vectored handler logs the faulting guest RIP. RIP - eboot_base = the ELF
-// vaddr of the exact writing instruction = the function to decompile. PS4 code
-// runs as native host x86-64, so the guest write is a real host instruction and
-// the debug registers trap it directly.
+// --- Facing-writer watchpoint (pure-static RE enabler) -----------------------
+// The character's true world-facing angle is player+0x34 (round-1 CSV capture:
+// it sweeps as the character turns and is inert to camera panning, unlike the
+// camera yaw at +0x54/+0x17c). Its writer -- the turn/steering code -- is invoked
+// through the engine's callback dispatch, so static call-graph tracing can't
+// reach it, and the offset is overloaded across dozens of classes so a field-scan
+// only finds false positives. A hardware DATA WRITE watchpoint pinpoints it: set
+// DR0 on player+0x34 (and DR1 on player+0x54 as a reference, a KNOWN camera-yaw
+// writer) on every thread; a write raises #DB and a vectored handler logs the
+// faulting guest RIP. RIP - eboot_base = the ELF vaddr of the exact writing
+// instruction = the function to decompile. PS4 code runs as native host x86-64,
+// so the guest write is a real host instruction and the debug registers trap it.
 #ifdef _WIN32
 std::atomic<bool> g_watch_installed{false};
 uintptr_t g_watch_base = 0;
@@ -441,7 +445,7 @@ LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* ep) {
         char buf[192];
         const int n = std::snprintf(
             buf, sizeof(buf), "WATCH dr%d (%s) writer ELF 0x%llx  (rip 0x%llx)\n", which,
-            which == 0 ? "player+0x54 target-heading" : which == 1 ? "player+0x17c facing" : "?",
+            which == 0 ? "player+0x34 facing (true)" : which == 1 ? "player+0x54 camera-yaw ref" : "?",
             static_cast<unsigned long long>(elf), static_cast<unsigned long long>(rip));
         WatchWrite(buf, n);
     }
@@ -507,14 +511,17 @@ void InstallHeadingWatch(std::FILE* file, uintptr_t base, uintptr_t player) {
                               nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     WatchWrite("# heading_watch: distinct RIPs of instructions that WRITE the watched fields\n", 76);
     AddVectoredExceptionHandler(1, WatchVeh);
+    // DR0 = the true facing field found in round 1 (its writer is the steering
+    // code we want); DR1 = camera yaw, kept as a reference so the run re-confirms
+    // the known camera writer and cleanly separates the two.
+    const uintptr_t a34 = player + 0x34;
     const uintptr_t a54 = player + 0x54;
-    const uintptr_t a17c = player + 0x17c;
-    SetHwWatchAllThreads(a54, a17c);
+    SetHwWatchAllThreads(a34, a54);
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "CAMDUMP heading watch armed: DR0=player+0x54 (0x%llx), DR1=player+0x17c "
+                  "CAMDUMP heading watch armed: DR0=player+0x34 (0x%llx), DR1=player+0x54 "
                   "(0x%llx); writer RIPs -> %s",
-                  static_cast<unsigned long long>(a54), static_cast<unsigned long long>(a17c),
+                  static_cast<unsigned long long>(a34), static_cast<unsigned long long>(a54),
                   p.c_str());
     EmitLine(file, buf);
 }
