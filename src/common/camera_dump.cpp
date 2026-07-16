@@ -78,6 +78,20 @@ constexpr uintptr_t kCandScan = 0x600;
 constexpr int kPollEverySecs = 1;
 constexpr int kRedumpEverySecs = 5;
 
+// --- Character-facing hunt (follow-up capture) -------------------------------
+// The camera step caches the CAMERA yaw at player+0x54/+0x17c every frame, so
+// those are the camera-relative reference frame, NOT the character's own facing.
+// The true facing lives in some other field. Sample a wide player-field window
+// at a high rate to a CSV so a controlled two-phase maneuver (turn the character
+// with the camera held still, then pan the camera with the character held still)
+// reveals offline which field tracks the character vs the camera.
+constexpr uintptr_t kFieldWindow = 0x500; // bytes of the player object to sample
+constexpr int kFieldHz = 30;              // sampler rate
+// Arm the +0x54/+0x17c write-watchpoint. Off for the field-hunt capture: those
+// writers are already known (camera step / FUN_01526750) and the debug-register
+// traps only add overhead now.
+constexpr bool kArmHeadingWatch = false;
+
 std::atomic<bool> g_started{false};
 // Manager slot the follow camera was found in (annotation only).
 uintptr_t g_found_slot = 0;
@@ -210,7 +224,10 @@ const char* XformTag(uintptr_t off) {
 // running executable. This makes the capture work from a launcher that can't
 // set environment variables (BB Launcher) with zero per-machine config, while
 // the env var still wins when present so output can be redirected.
-std::string DefaultDumpPath() {
+// A path to `name` in the directory of the running executable (so output lands
+// next to shadPS4.exe under a launcher that can't set env vars), falling back to
+// the working directory if the module path can't be resolved.
+std::string SiblingPath(const char* name) {
 #ifdef _WIN32
     char buf[MAX_PATH];
     const DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
@@ -219,12 +236,16 @@ std::string DefaultDumpPath() {
         const size_t slash = path.find_last_of("\\/");
         if (slash != std::string::npos) {
             path.resize(slash + 1);
-            path += "bb_camera_dump.txt";
+            path += name;
             return path;
         }
     }
 #endif
-    return "bb_camera_dump.txt"; // fallback: current working directory
+    return name; // fallback: current working directory
+}
+
+std::string DefaultDumpPath() {
+    return SiblingPath("bb_camera_dump.txt");
 }
 
 std::FILE* OpenDumpFile(std::string& path_out) {
@@ -550,7 +571,7 @@ void DumpPlayer(std::FILE* file, uintptr_t base, uintptr_t followcam) {
         EmitLine(file, buf);
         // Arm the hardware write-watchpoint on the confirmed player once, to
         // catch the dispatched turn code that writes the target heading.
-        if (match) {
+        if (match && kArmHeadingWatch) {
             InstallHeadingWatch(file, base, player);
         }
         for (uintptr_t off = kXformBegin; off < kXformEnd; off += 4) {
@@ -652,6 +673,77 @@ void DumpOnce(std::FILE* file, uintptr_t base, uintptr_t manager, uintptr_t foll
     }
 }
 
+// Resolve the local player ChrIns via WorldChrMan -> ChrManager(+0x60) -> +0x60,
+// returning it only if its vtable matches the known player class so that load
+// screens / uninitialized slots (garbage or stale pointers) are skipped. 0 if
+// not currently available. Every hop is guard-read so a wild pointer never
+// faults (shadPS4's vectored handler would treat that as fatal).
+uintptr_t ResolvePlayerMatched(uintptr_t base) {
+    uintptr_t wcm = 0;
+    if (!SafeRead(base + kWorldChrManGlobal, wcm) || !IsHeapPtr(wcm, base)) {
+        return 0;
+    }
+    uintptr_t mgr = 0;
+    if (!SafeRead(wcm + kWcmToChrManager, mgr) || !IsHeapPtr(mgr, base)) {
+        return 0;
+    }
+    uintptr_t player = 0;
+    if (!SafeRead(mgr + kMgrToPlayer, player) || !IsHeapPtr(player, base)) {
+        return 0;
+    }
+    uintptr_t pvt = 0;
+    if (!SafeRead(player, pvt) || pvt != base + kPlayerVtableElf) {
+        return 0;
+    }
+    return player;
+}
+
+// High-rate wide-window sampler: log player+0x00..+kFieldWindow as f32 columns
+// to player_fields.csv at kFieldHz, for the whole session. Offline, the column
+// that sweeps a full angular range during the "turn the character, camera held
+// still" phase but stays flat during the "pan the camera, character held still"
+// phase is the character's true facing (the camera yaw at +0x54/+0x17c does the
+// opposite). Separate file + thread so it never perturbs the readable dump; the
+// row is flushed each sample so a mid-capture crash keeps everything so far.
+void PlayerFieldLoop() {
+    const std::string path = SiblingPath("player_fields.csv");
+    std::FILE* csv = std::fopen(path.c_str(), "w");
+    if (csv == nullptr) {
+        LOG_WARNING(Loader, "Bloodborne player-field sampler: could not open '{}'", path);
+        return;
+    }
+    LOG_INFO(Loader, "Bloodborne player-field sampler active -> {}", path);
+
+    std::fprintf(csv, "t_ms");
+    for (uintptr_t off = 0; off < kFieldWindow; off += 4) {
+        std::fprintf(csv, ",0x%03llx", static_cast<unsigned long long>(off));
+    }
+    std::fprintf(csv, "\n");
+    std::fflush(csv);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto period = std::chrono::milliseconds(1000 / kFieldHz);
+    u8 window[kFieldWindow];
+    while (true) {
+        const uintptr_t base = MemoryPatcher::g_eboot_address;
+        const uintptr_t player = base != 0 ? ResolvePlayerMatched(base) : 0;
+        if (player != 0 && SafeReadBytes(player, window, kFieldWindow)) {
+            const long long t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - t0)
+                                       .count();
+            std::fprintf(csv, "%lld", t_ms);
+            for (uintptr_t off = 0; off < kFieldWindow; off += 4) {
+                float f;
+                std::memcpy(&f, window + off, sizeof(f));
+                std::fprintf(csv, ",%.6g", f);
+            }
+            std::fprintf(csv, "\n");
+            std::fflush(csv);
+        }
+        std::this_thread::sleep_for(period);
+    }
+}
+
 void PollLoop(std::FILE* file) {
     const uintptr_t base = MemoryPatcher::g_eboot_address;
 
@@ -732,6 +824,8 @@ void StartCameraDump() {
     }
     LOG_INFO(Loader, "Bloodborne camera+player dumper active -> {}", path);
     std::thread(PollLoop, file).detach();
+    // Independent high-rate sampler for the character-facing hunt (own file).
+    std::thread(PlayerFieldLoop).detach();
 }
 
 } // namespace Common
