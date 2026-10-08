@@ -555,3 +555,6 @@ target_link_libraries(shadps4_net_kernel_test PRIVATE
     tsl::robin_map         # fs.h
     miniupnpc::miniupnpc   # UPnP forwarding of the P2P port
 )
+
+# Controller response and live tuning, independently buildable without emulator dependencies.
+add_subdirectory(input)

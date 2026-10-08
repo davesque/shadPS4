@@ -3,11 +3,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <utility>
 
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/libraries/pad/pad.h"
 #include "input/controller.h"
+#include "input/controller_tuning.h"
 
 namespace Input {
 
@@ -67,13 +70,27 @@ void State::OnAccel(const float accel[3]) {
 }
 
 void State::UpdateAxisSmoothing(u64 timestamp) {
+    static const u64 smoothing_time = []() -> u64 {
+        const char* value = std::getenv("SHAD_AXIS_SMOOTH_MS");
+        if (value && *value) {
+            const auto duration = ParseAxisSmoothing(value);
+            if (duration) {
+                LOG_INFO(Input, "Axis smoothing configured to {} microseconds", duration->count());
+                return static_cast<u64>(duration->count());
+            }
+            LOG_WARNING(Input, "Invalid SHAD_AXIS_SMOOTH_MS '{}'; disabling smoothing", value);
+        }
+        return 0;
+    }();
     for (int i = 0; i < std::to_underlying(Axis::AxisMax); ++i) {
-        if (!axis_smoothing_flags[i] || std::abs(axes[i] - axis_smoothing_end_values[i]) < 16) {
+        if (smoothing_time == 0 || !axis_smoothing_flags[i] ||
+            std::abs(axes[i] - axis_smoothing_end_values[i]) < 16) {
             axes[i] = axis_smoothing_end_values[i];
             continue;
         }
-        const f32 t = std::clamp(
-            (timestamp - axis_smoothing_start_times[i]) / f32{axis_smoothing_time}, 0.f, 1.f);
+        const f32 t = std::clamp((timestamp - axis_smoothing_start_times[i]) /
+                                     static_cast<f32>(smoothing_time),
+                                 0.f, 1.f);
         axes[i] = s32(axis_smoothing_start_values[i] * (1 - t) + axis_smoothing_end_values[i] * t);
     }
 }
