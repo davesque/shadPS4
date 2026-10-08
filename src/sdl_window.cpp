@@ -11,6 +11,7 @@
 #include <stb_image.h>
 
 #include "common/assert.h"
+#include "common/automation.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/logging/formatter.h"
@@ -24,6 +25,7 @@
 #include "core/user_settings.h"
 #include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
+#include "input/automation.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
@@ -113,6 +115,12 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
 #endif
     SDL_InitSubSystem(SDL_INIT_AUDIO);
 
+    if (Common::IsAutomationMode()) {
+        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "0");
+        SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "0");
+        EmulatorSettings.SetFullScreen(false);
+    }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING,
                           std::string(window_title).c_str());
@@ -127,6 +135,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // width/height as the windowed size to restore when leaving fullscreen.
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN,
                            EmulatorSettings.IsFullScreen());
+    if (Common::IsAutomationMode()) {
+        SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, -16000);
+        SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, -16000);
+        SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "shadPS4 automation");
+    }
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     if (window == nullptr) {
@@ -205,7 +218,10 @@ void WindowSDL::WaitEvent() {
     // Called on main thread
     SDL_Event event;
 
-    if (!SDL_WaitEvent(&event)) {
+    if (Common::IsAutomationMode()) {
+        Input::PollAutomation(controllers);
+    }
+    if (!(Common::IsAutomationMode() ? SDL_WaitEventTimeout(&event, 16) : SDL_WaitEvent(&event))) {
         return;
     }
 
@@ -343,7 +359,9 @@ void WindowSDL::InitTimers() {
     for (int i = 0; i < 4; ++i) {
         SDL_AddTimer(4, &PollController, controllers[i]);
     }
-    SDL_AddTimer(33, Input::MousePolling, (void*)controllers[0]);
+    if (!Common::IsAutomationMode()) {
+        SDL_AddTimer(33, Input::MousePolling, (void*)controllers[0]);
+    }
 }
 
 void WindowSDL::RequestKeyboard() {
