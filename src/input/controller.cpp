@@ -129,16 +129,29 @@ void GameController::ResetOrientation() {
     PushStateLocked();
 }
 
-void GameController::SetTouchpadState(int touch_index, bool touch_down, float x, float y) {
-    if (touch_index < 0 || touch_index >= 2) {
+void GameController::SyntheticTouchpadButton(bool pressed, float x) {
+    std::lock_guard lock{m_state_mutex};
+    const auto index = static_cast<size_t>(std::lround(x * 4)) - 1;
+    if (index >= m_synthetic_buttons.size() || m_synthetic_buttons[index] == pressed) {
         return;
     }
-
-    std::lock_guard lock{m_state_mutex};
+    m_synthetic_buttons[index] = pressed;
+    if (!pressed && std::ranges::any_of(m_synthetic_buttons, [](bool held) { return held; })) {
+        // Another mapped touchpad button still holds the shared click.
+        return;
+    }
     const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    // A mapped click is always a new touch, even when a finger already rests on the touchpad.
+    SetTouchLocked(0, pressed, x, 0.5f, timestamp, pressed);
+    m_state.OnButton(OrbisPadButtonDataOffset::TouchPad, pressed);
+    PushStateLocked(timestamp);
+}
+
+void GameController::SetTouchLocked(int touch_index, bool touch_down, float x, float y,
+                                    u64 timestamp, bool new_touch) {
     const bool was_pressed = m_state.touchpad[0].state || m_state.touchpad[1].state;
     auto& touch = m_state.touchpad[touch_index];
-    if (touch_down && !touch.state) {
+    if (touch_down && (new_touch || !touch.state)) {
         touch.ID = m_next_touch_id;
         m_next_touch_id = m_next_touch_id == 127 ? 1 : m_next_touch_id + 1;
     }
@@ -149,6 +162,16 @@ void GameController::SetTouchpadState(int touch_index, bool touch_down, float x,
     } else if (was_pressed && !is_pressed) {
         m_touch_down_timestamp = 0;
     }
+}
+
+void GameController::SetTouchpadState(int touch_index, bool touch_down, float x, float y) {
+    if (touch_index < 0 || touch_index >= 2) {
+        return;
+    }
+
+    std::lock_guard lock{m_state_mutex};
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    SetTouchLocked(touch_index, touch_down, x, y, timestamp, false);
     PushStateLocked(timestamp);
 }
 
@@ -181,6 +204,7 @@ void GameController::DisconnectController() {
     std::fill(gyro_buf, gyro_buf + 3, 0.0f);
     std::fill(accel_buf, accel_buf + 3, 0.0f);
     accel_buf[1] = 9.81f;
+    m_synthetic_buttons = {};
     m_next_touch_id = 1;
     m_touch_down_timestamp = 0;
     m_state.connected = false;
