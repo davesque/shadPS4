@@ -82,6 +82,7 @@ void IPC::Init() {
     std::cerr << ";#IPC_ENABLED\n";
     std::cerr << ";ENABLE_MEMORY_PATCH\n";
     std::cerr << ";ENABLE_EMU_CONTROL\n";
+    std::cerr << ";ENABLE_INPUT_RELOAD_ACK\n";
     std::cerr << ";#IPC_END\n";
     std::cerr.flush();
 
@@ -210,8 +211,15 @@ void IPC::InputLoop() {
                 ref->CancelRemoveFigure(index);
             }
         } else if (cmd == "RELOAD_INPUTS") {
-            std::string config = next_str();
-            Input::ParseInputConfig(config);
+            const std::string config = next_str();
+            SDL_Event event{};
+            event.type = SDL_EVENT_RELOAD_INPUTS;
+            event.user.code = 1;
+            event.user.data1 = SDL_strdup(config.c_str());
+            if (!event.user.data1 || !SDL_PushEvent(&event)) {
+                SDL_free(event.user.data1);
+                std::cerr << ";INPUTS_RELOAD_FAILED " << config << std::endl;
+            }
         } else {
             std::cerr << ";UNKNOWN CMD: " << cmd << std::endl;
         }

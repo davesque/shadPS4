@@ -147,6 +147,18 @@ void GameController::SyntheticTouchpadButton(bool pressed, float x) {
     PushStateLocked(timestamp);
 }
 
+void GameController::ResetSyntheticTouchpad() {
+    std::lock_guard lock{m_state_mutex};
+    if (std::ranges::none_of(m_synthetic_buttons, [](bool held) { return held; })) {
+        return;
+    }
+    m_synthetic_buttons = {};
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    SetTouchLocked(0, false, m_state.touchpad[0].x / 1920.0f, 0.5f, timestamp, false);
+    m_state.OnButton(OrbisPadButtonDataOffset::TouchPad, false);
+    PushStateLocked(timestamp);
+}
+
 void GameController::SetTouchLocked(int touch_index, bool touch_down, float x, float y,
                                     u64 timestamp, bool new_touch) {
     const bool was_pressed = m_state.touchpad[0].state || m_state.touchpad[1].state;

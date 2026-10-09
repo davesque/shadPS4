@@ -106,6 +106,7 @@ public:
     bool SetVibration(u8 smallMotor, u8 largeMotor);
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
     void SyntheticTouchpadButton(bool pressed, float x);
+    void ResetSyntheticTouchpad();
 
     float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
     s32 user_id = Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID;

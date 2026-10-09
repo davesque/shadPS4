@@ -356,15 +356,21 @@ std::optional<int> parseInt(const std::string& s) {
     }
 };
 
-void ParseInputConfig(const std::string game_id = "") {
+bool ParseInputConfig(const std::string game_id, bool explicit_profile) {
     std::string game_id_or_default =
-        EmulatorSettings.IsUseUnifiedInputConfig() ? "default" : game_id;
+        explicit_profile ? game_id
+                         : (EmulatorSettings.IsUseUnifiedInputConfig() ? "default" : game_id);
     const auto config_file = GetInputConfigFile(game_id_or_default);
     const auto global_config_file = GetInputConfigFile("global");
 
     // we reset these here so in case the user fucks up or doesn't include some of these,
     // we can fall back to default
-    connections.clear();
+    std::ifstream config_stream(config_file);
+    if (!config_stream) {
+        LOG_ERROR(Input, "Failed to open input profile {}", game_id_or_default);
+        return false;
+    }
+    std::vector<BindingConnection> next_connections;
     float mouse_deadzone_offset = 0.5;
     float mouse_speed = 1;
     float mouse_speed_offset = 0.125;
@@ -380,7 +386,6 @@ void ParseInputConfig(const std::string game_id = "") {
 
     int lineCount = 0;
 
-    std::ifstream config_stream(config_file);
     std::ifstream global_config_stream(global_config_file);
     std::string line = "";
     auto ProcessLine = [&]() -> void {
@@ -469,7 +474,7 @@ void ParseInputConfig(const std::string game_id = "") {
                     &*std::ranges::find(output_arrays[0].data, ControllerOutput(KEY_TOGGLE));
                 BindingConnection toggle_connection = BindingConnection(
                     InputBinding(toggle_keys.keys[0]), toggle_out, 0, toggle_keys.keys[1]);
-                connections.insert(connections.end(), toggle_connection);
+                next_connections.insert(next_connections.end(), toggle_connection);
                 return;
             }
             LOG_WARNING(Input, "Invalid format at line: {}, data: \"{}\", skipping line.",
@@ -595,10 +600,10 @@ void ParseInputConfig(const std::string game_id = "") {
             for (int i = 0; i < output_arrays.size(); i++) {
                 BindingConnection copy = connection.CopyWithChangedGamepadId(i + 1);
                 copy.output = &*std::ranges::find(output_arrays[i].data, *connection.output);
-                connections.push_back(copy);
+                next_connections.push_back(copy);
             }
         } else {
-            connections.push_back(connection);
+            next_connections.push_back(connection);
         }
         LOG_DEBUG(Input, "Succesfully parsed line {}", lineCount);
     };
@@ -610,11 +615,29 @@ void ParseInputConfig(const std::string game_id = "") {
         ProcessLine();
     }
     config_stream.close();
-    std::sort(connections.begin(), connections.end());
+    std::sort(next_connections.begin(), next_connections.end());
+    connections.swap(next_connections);
+    toggled_keys.clear();
+    for (size_t index = 0; index < 5; ++index) {
+        ControllerOutput::controllers[index]->ResetSyntheticTouchpad();
+        for (auto& output : output_arrays[index].data) {
+            if (output.button == SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT ||
+                output.button == SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER ||
+                output.button == SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT) {
+                output.old_button_state = false;
+            }
+        }
+    }
+    if (explicit_profile) {
+        EmulatorSettings.SetUseUnifiedInputConfig(game_id_or_default == "default");
+    }
+    ActivateOutputsFromInputs(true);
     for (auto& c : connections) {
         LOG_DEBUG(Input, "Binding: {} : {}", c.output->ToString(), c.binding.ToString());
     }
-    LOG_DEBUG(Input, "Done parsing the input config!");
+    LOG_INFO(Input, "Loaded input profile {} with {} bindings", game_id_or_default,
+             connections.size());
+    return true;
 }
 
 BindingConnection BindingConnection::CopyWithChangedGamepadId(u8 gamepad) {
@@ -691,10 +714,10 @@ void ControllerOutput::ResetUpdate() {
     new_button_state = false;
     *new_param = 0; // bruh
 }
-void ControllerOutput::AddUpdate(InputEvent event) {
+void ControllerOutput::AddUpdate(InputEvent event, bool reconcile) {
     switch (button) {
     case KEY_TOGGLE:
-        if (event.active) {
+        if (!reconcile && event.active) {
             ToggleKeyInList(event.input);
         }
         return;
@@ -717,7 +740,7 @@ void ControllerOutput::AddUpdate(InputEvent event) {
     }
 }
 
-void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
+void ControllerOutput::FinalizeUpdate(u8 gamepad_index, bool reconcile) {
     auto PushSDLEvent = [&](u32 event_type) {
         if (new_button_state) {
             SDL_Event e;
@@ -732,6 +755,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
     }
     old_button_state = new_button_state;
     old_param = *new_param;
+    if (reconcile && button >= HOTKEY_FULLSCREEN && button <= HOTKEY_TOGGLE_FRIENDS) {
+        return;
+    }
     GameController* controller;
     if (gamepad_index < 5)
         controller = controllers[gamepad_index];
@@ -755,9 +781,7 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             rightjoystick_halfmode = new_button_state;
             break;
         case HOTKEY_RELOAD_INPUTS:
-            if (new_button_state) {
-                ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
-            }
+            PushSDLEvent(SDL_EVENT_RELOAD_INPUTS);
             break;
         case HOTKEY_FULLSCREEN:
             PushSDLEvent(SDL_EVENT_TOGGLE_FULLSCREEN);
@@ -893,11 +917,9 @@ bool UpdatePressedKeys(InputEvent event) {
         return true;
     } else if (event.active) {
         // Find the correct position for insertion to maintain order
-        auto it = std::lower_bound(pressed_keys.begin(), pressed_keys.end(), input,
-                                   [](const std::pair<InputEvent, bool>& e, InputID i) {
-                                       return std::tie(e.first.input.type, e.first.input.sdl_id) <
-                                              std::tie(i.type, i.sdl_id);
-                                   });
+        auto it = std::lower_bound(
+            pressed_keys.begin(), pressed_keys.end(), input,
+            [](const std::pair<InputEvent, bool>& e, InputID i) { return e.first.input < i; });
 
         // Insert only if 'value' is not already in the list
         if (it == pressed_keys.end() || it->first.input != input) {
@@ -991,7 +1013,7 @@ InputEvent BindingConnection::ProcessBinding() {
     return event; // All keys are active
 }
 
-void ActivateOutputsFromInputs() {
+void ActivateOutputsFromInputs(bool reconcile) {
 
     // todo find a better solution
     for (int i = 0; i < output_arrays.size(); i++) {
@@ -1011,13 +1033,13 @@ void ActivateOutputsFromInputs() {
         for (auto& it : connections) {
             // only update this when it's the correct pass
             if (it.output->gamepad_id == i) {
-                it.output->AddUpdate(it.ProcessBinding());
+                it.output->AddUpdate(it.ProcessBinding(), reconcile);
             }
         }
 
         // Update all outputs
         for (auto& it : output_arrays[i].data) {
-            it.FinalizeUpdate(i);
+            it.FinalizeUpdate(i, reconcile);
         }
     }
 }
