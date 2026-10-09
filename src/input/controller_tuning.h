@@ -15,8 +15,8 @@
 namespace Input {
 
 struct CameraResponse {
-    float sensitivity = 1.55f;
-    float curve = 1.1f;
+    float sensitivity = 1.0f;
+    float curve = 1.0f;
 
     std::int16_t Apply(std::int16_t value) const;
 };

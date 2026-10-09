@@ -22,11 +22,15 @@ void Check(bool condition, const char* message) {
 
 void TestResponse() {
     const Input::CameraResponse linear{1.0f, 1.0f};
-    const Input::CameraResponse tuned;
+    const Input::CameraResponse tuned{1.55f, 1.1f};
+    const Input::CameraResponse defaults;
+    Check(defaults.sensitivity == 1.0f && defaults.curve == 1.0f,
+          "Default response must be neutral");
     int previous = 0;
     for (int value = 0; value <= 128; ++value) {
         Check(linear.Apply(value) == value, "Linear response must preserve input");
         Check(linear.Apply(-value) == -value, "Linear response must preserve negative input");
+        Check(defaults.Apply(value) == value, "Default response must preserve input");
         const auto output = tuned.Apply(value);
         Check(output >= previous && output <= 128, "Tuned response must be bounded and monotonic");
         Check(tuned.Apply(-value) == -output, "Tuned response must be symmetric");
@@ -34,7 +38,7 @@ void TestResponse() {
     }
     Check(tuned.Apply(0) == 0, "Neutral stick must remain neutral");
     Check(tuned.Apply(128) == 128, "Full stick must reach maximum output");
-    Check(tuned.Apply(64) > 64, "Existing tuned defaults must increase mid-stick response");
+    Check(tuned.Apply(64) > 64, "Higher sensitivity must increase mid-stick response");
     Check(Input::CameraResponse{1.0f, 2.0f}.Apply(64) == 32, "Curve must shape intermediate input");
     Check(Input::CameraResponse{0.5f, 1.0f}.Apply(128) == 64,
           "Sensitivity must allow slower response");
