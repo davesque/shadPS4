@@ -18,6 +18,7 @@
 #include "common/automation.h"
 #include "common/logging/log.h"
 #include "input/controller.h"
+#include "input/input_handler.h"
 #include "video_core/renderdoc.h"
 
 namespace Input {
@@ -57,9 +58,21 @@ public:
                 if (!(parser >> cmd.target) || !buttons.contains(cmd.target)) {
                     throw std::runtime_error("Invalid automation button");
                 }
-            } else if (cmd.verb == "axis") {
+            } else if (cmd.verb == "contact_left" || cmd.verb == "contact_right") {
+                if (!(parser >> cmd.target) || (cmd.target != "down" && cmd.target != "up")) {
+                    throw std::runtime_error("Invalid automation contact");
+                }
+            } else if (cmd.verb == "key_press" || cmd.verb == "key_release" ||
+                       cmd.verb == "mapped_button_press" || cmd.verb == "mapped_button_release") {
+                const bool gamepad = cmd.verb.starts_with("mapped_button");
+                if (!(parser >> cmd.target) ||
+                    (gamepad ? cmd.target != "back" : cmd.target != "g" && cmd.target != "h")) {
+                    throw std::runtime_error("Invalid automation mapped input");
+                }
+            } else if (cmd.verb == "axis" || cmd.verb == "mapped_axis") {
                 if (!(parser >> cmd.target >> cmd.value) || !axes.contains(cmd.target) ||
-                    cmd.value < 0 || cmd.value > 255) {
+                    (cmd.verb == "axis" ? cmd.value < 0 || cmd.value > 255
+                                        : cmd.value < -32768 || cmd.value > 32767)) {
                     throw std::runtime_error("Invalid automation axis");
                 }
             } else if (cmd.verb != "screenshot" && cmd.verb != "recenter" && cmd.verb != "quit") {
@@ -83,6 +96,27 @@ public:
             auto* controller = controllers[0];
             if (cmd.verb == "press" || cmd.verb == "release") {
                 controller->Button(buttons.at(cmd.target), cmd.verb == "press");
+            } else if (cmd.verb == "contact_left" || cmd.verb == "contact_right") {
+                controller->SetTouchpadState(0, cmd.target == "down",
+                                             cmd.verb == "contact_left" ? 0.25f : 0.75f, 0.5f);
+            } else if (cmd.verb == "key_press" || cmd.verb == "key_release" ||
+                       cmd.verb == "mapped_button_press" || cmd.verb == "mapped_button_release") {
+                const bool gamepad = cmd.verb.starts_with("mapped_button");
+                const auto key =
+                    gamepad ? SDL_GAMEPAD_BUTTON_BACK : (cmd.target == "g" ? SDLK_G : SDLK_H);
+                const auto event =
+                    InputEvent{gamepad ? InputType::Controller : InputType::KeyboardMouse, key,
+                               cmd.verb.ends_with("press"), 0};
+                if (UpdatePressedKeys(event)) {
+                    ActivateOutputsFromInputs();
+                }
+            } else if (cmd.verb == "mapped_axis") {
+                const auto event =
+                    InputEvent{InputID{InputType::Axis, static_cast<u32>(axes.at(cmd.target)), 1},
+                               true, static_cast<s8>(cmd.value / 256)};
+                if (UpdatePressedKeys(event)) {
+                    ActivateOutputsFromInputs();
+                }
             } else if (cmd.verb == "axis") {
                 controller->Axis(axes.at(cmd.target), cmd.value, false);
             } else if (cmd.verb == "recenter") {

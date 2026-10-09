@@ -456,6 +456,20 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
                                    "pad_reads.csv"};
         static bool header = false;
         const auto now = std::chrono::steady_clock::now();
+        static std::ofstream touches{Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
+                                     "touch_reads.csv"};
+        static bool touch_header = false;
+        if (!touch_header) {
+            touches << "elapsed,buttons,count,id,x,y,held\n";
+            touch_header = true;
+        }
+        touches << std::chrono::duration<double>(now - start).count() << ','
+                << static_cast<u32>(pData[0].buttons) << ',' << int(pData[0].touchData.touchNum)
+                << ',' << int(pData[0].touchData.touch[0].id) << ','
+                << pData[0].touchData.touch[0].x << ',' << pData[0].touchData.touch[0].y << ','
+                << pData[0].touchData.time_since_touch_held_down << '\n';
+        touches.flush();
+
         if (now - last >= std::chrono::milliseconds{100}) {
             last = now;
             if (!header) {
