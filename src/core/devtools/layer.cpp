@@ -3,10 +3,16 @@
 
 #include "layer.h"
 
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <limits>
+
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
 #include "SDL3/SDL_log.h"
+#include "common/present_log.h"
 #include "common/singleton.h"
 #include "common/types.h"
 #include "core/debug_state.h"
@@ -418,6 +424,125 @@ void L::Draw() {
         ImVec2 pos = ImVec2(10, 10);
         ImU32 color = IM_COL32(255, 255, 255, 255);
         ImGui::GetForegroundDrawList()->AddText(pos, color, "Emulation Paused");
+    }
+
+    // Always-visible telemetry readout (foreground draw list -> can't be parked
+    // off-screen like the "Video Info" window). Gated by SHAD_PRESENT_LOG so it
+    // only appears during a diagnostic session, and hidden by SHAD_PRESENT_OVERLAY=0.
+    // Lets the user A/B our measured present rate against an external overlay
+    // (e.g. Nvidia) on the same screen.
+    if (Common::PresentOverlayEnabled()) {
+        const auto o = Common::PresentGetOnscreen();
+        auto* dl = ImGui::GetForegroundDrawList();
+        const ImVec2 pos{10.0f, 40.0f};
+        if (!o.valid) {
+            dl->AddText(ImVec2{pos.x + 1.0f, pos.y + 1.0f}, IM_COL32(0, 0, 0, 220),
+                        "shadPS4 present: measuring...");
+            dl->AddText(pos, IM_COL32(255, 255, 0, 255), "shadPS4 present: measuring...");
+        }
+
+        // One scrolling sparkline per metric (last ~3 minutes, 1 sample/sec),
+        // laid out in a single row, each with its current value and a
+        // least-squares trendline so drift is visible at a glance rather than
+        // only in the log file afterwards.
+        const auto& series = Common::PresentGetSeries();
+        // Fixed 30-sample viewport: samples enter at the right edge and scroll
+        // off the left (FIFO), rather than compressing the x-axis as history
+        // accumulates.
+        constexpr int kView = 30;
+        const int window = std::min({series.count, Common::PresentSeries::kN, kView});
+        if (o.valid && window >= 2) {
+            constexpr float kW = 240.0f, kH = 40.0f, kGap = 6.0f;
+            float x0 = pos.x;
+            const float y0 = pos.y;
+            const auto sample = [&](const std::array<float, Common::PresentSeries::kN>& a,
+                                    int i) {
+                return a[(series.count - window + i) % Common::PresentSeries::kN];
+            };
+            struct Chart {
+                const char* name;
+                const std::array<float, Common::PresentSeries::kN>* data;
+                ImU32 color;
+            };
+            const Chart charts[] = {
+                {"fps", &series.fps, IM_COL32(255, 255, 0, 255)},
+                {"submit", &series.submit, IM_COL32(255, 160, 0, 255)},
+                {"worst ms", &series.worst, IM_COL32(255, 80, 80, 255)},
+                {"phase ms", &series.phase, IM_COL32(80, 220, 255, 255)},
+                {"gpubusy ms/s", &series.gpubusy, IM_COL32(120, 255, 120, 255)},
+                {"gpuwait ms/s", &series.gpuwait, IM_COL32(255, 120, 255, 255)},
+            };
+            static std::array<ImVec2, Common::PresentSeries::kN> pts;
+            for (const Chart& c : charts) {
+                float raw_min = std::numeric_limits<float>::max();
+                float raw_max = std::numeric_limits<float>::lowest();
+                for (int i = 0; i < window; ++i) {
+                    const float v = sample(*c.data, i);
+                    raw_min = std::min(raw_min, v);
+                    raw_max = std::max(raw_max, v);
+                }
+                // Pad the range so a flat series still draws mid-box.
+                const float pad = std::max((raw_max - raw_min) * 0.10f, 0.5f);
+                const float vmin = raw_min - pad;
+                const float vmax = raw_max + pad;
+                const auto to_y = [&](float v) {
+                    return y0 + kH - 2.0f - (v - vmin) / (vmax - vmin) * (kH - 4.0f);
+                };
+                dl->AddRectFilled(ImVec2{x0, y0}, ImVec2{x0 + kW, y0 + kH},
+                                  IM_COL32(0, 0, 0, 150), 3.0f);
+                // Least-squares trendline over the window (x = sample index).
+                double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+                for (int i = 0; i < window; ++i) {
+                    const double v = sample(*c.data, i);
+                    sx += i;
+                    sy += v;
+                    sxx += static_cast<double>(i) * i;
+                    sxy += i * v;
+                }
+                const double n = window;
+                const double denom = n * sxx - sx * sx;
+                const double slope = denom != 0.0 ? (n * sxy - sx * sy) / denom : 0.0;
+                const double intercept = (sy - slope * sx) / n;
+                const auto trend = [&](int i) {
+                    return std::clamp(static_cast<float>(intercept + slope * i), vmin, vmax);
+                };
+                // Right-align the window so the newest sample is always at the
+                // right edge; during warmup (fewer than kView samples) the line
+                // grows leftward from there.
+                const auto to_x = [&](int i) {
+                    return x0 + 2.0f + (kW - 4.0f) * (kView - window + i) / (kView - 1);
+                };
+                dl->AddLine(ImVec2{to_x(0), to_y(trend(0))},
+                            ImVec2{to_x(window - 1), to_y(trend(window - 1))},
+                            IM_COL32(255, 255, 255, 130), 1.0f);
+                for (int i = 0; i < window; ++i) {
+                    pts[i] = ImVec2{to_x(i), to_y(sample(*c.data, i))};
+                }
+                dl->AddPolyline(pts.data(), window, c.color, 0, 1.5f);
+                // Metric name above the chart; current value and window
+                // min/max below it, e.g. "60.0 [25.3,60.0]". Position from the
+                // live font height -- the UI font is DPI-scaled, so fixed pixel
+                // offsets overlap the chart on high-res displays.
+                const float fh = ImGui::GetFontSize();
+                dl->AddText(ImVec2{x0 + 3.0f, y0 - fh - 2.0f}, IM_COL32(0, 0, 0, 220), c.name);
+                dl->AddText(ImVec2{x0 + 2.0f, y0 - fh - 3.0f}, c.color, c.name);
+                char figures[64];
+                std::snprintf(figures, sizeof(figures), "%.1f [%.1f,%.1f]",
+                              sample(*c.data, window - 1), raw_min, raw_max);
+                // Flush against the box's bottom edge: glyphs render a few px
+                // below the text-cell origin, so a positive gap here reads
+                // roughly twice as large as the same gap above the box.
+                dl->AddText(ImVec2{x0 + 3.0f, y0 + kH + 1.0f}, IM_COL32(0, 0, 0, 220), figures);
+                dl->AddText(ImVec2{x0 + 2.0f, y0 + kH}, c.color, figures);
+                x0 += kW + kGap;
+            }
+            if (o.phase_warn) {
+                dl->AddText(ImVec2{x0 + 5.0f, y0 + 3.0f}, IM_COL32(0, 0, 0, 220),
+                            "!! VBLANK BOUNDARY");
+                dl->AddText(ImVec2{x0 + 4.0f, y0 + 2.0f}, IM_COL32(255, 64, 64, 255),
+                            "!! VBLANK BOUNDARY");
+            }
+        }
     }
 
     if (show_simple_fps) {

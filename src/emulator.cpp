@@ -45,6 +45,7 @@
 #include "core/memory.h"
 #include "core/user_settings.h"
 #include "emulator.h"
+#include "input/bench_input.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
 
@@ -706,6 +707,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     linker->Execute(args);
 
     window->InitTimers();
+    Input::StartBenchInput(controllers);
     while (window->IsOpen()) {
         window->WaitEvent();
     }

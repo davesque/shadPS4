@@ -831,6 +831,10 @@ set(COMMON src/common/logging/classes.cpp
            src/common/string_literal.h
            src/common/string_util.cpp
            src/common/string_util.h
+           src/common/stutter_log.cpp
+           src/common/stutter_log.h
+           src/common/present_log.cpp
+           src/common/present_log.h
            src/common/thread.cpp
            src/common/thread.h
            src/common/types.h
@@ -1266,6 +1270,8 @@ set(IMGUI src/imgui/imgui_config.h
 set(INPUT src/input/automation.cpp
           src/input/automation.h
           src/common/automation.h
+          src/input/bench_input.cpp
+          src/input/bench_input.h
           src/input/controller.cpp
           src/input/controller.h
           src/input/controller_state.cpp
@@ -1402,7 +1408,7 @@ elseif (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
 endif()
 
 if (WIN32)
-    target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid)
+    target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid dwmapi)
 
     if (MSVC)
         # MSVC likes putting opinions on what people can use, disable:

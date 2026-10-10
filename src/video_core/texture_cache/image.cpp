@@ -3,6 +3,7 @@
 
 #include <memory>
 #include "common/assert.h"
+#include "common/stutter_log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -126,6 +127,8 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
              Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
     : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
+    // Telemetry: time image creation (vkCreateImage + device-memory allocation).
+    Common::StutterScope _prof{Common::StutterCat::ImgCreate, "IMG_CREATE"};
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }

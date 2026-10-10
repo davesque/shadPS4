@@ -42,6 +42,13 @@ public:
 
     void End();
 
+    // Nudge the next wait by delta without changing the steady-state period.
+    // Lets an external phase reference (e.g. the display's vblank clock) steer
+    // the timer instead of letting it free-run.
+    void Adjust(std::chrono::nanoseconds delta) {
+        total_wait += delta;
+    }
+
     std::chrono::nanoseconds GetTotalWait() const {
         return total_wait;
     }
