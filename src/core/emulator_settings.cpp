@@ -9,6 +9,7 @@
 #include <common/scm_rev.h>
 #include <toml.hpp>
 #include "common/assert.h"
+#include "common/automation.h"
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
 #include "emulator_settings.h"
@@ -177,6 +178,9 @@ const std::vector<bool> EmulatorSettingsImpl::GetGameInstallDirsEnabled() {
 }
 
 std::filesystem::path EmulatorSettingsImpl::GetHomeDir() {
+    if (Common::IsAutomationMode()) {
+        return Common::FS::GetUserPath(Common::FS::PathType::HomeDir);
+    }
     if (m_general.home_dir.value.empty()) {
         return Common::FS::GetUserPath(Common::FS::PathType::HomeDir);
     }

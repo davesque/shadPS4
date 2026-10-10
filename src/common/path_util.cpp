@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fstream>
+#include <stdexcept>
 #include <unordered_map>
+#include "common/automation.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/scope_exit.h"
@@ -88,6 +90,14 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 static auto UserPaths = [] {
     // Try the portable user directory first.
     auto user_dir = std::filesystem::current_path() / PORTABLE_DIR;
+    if (Common::IsAutomationMode()) {
+        user_dir = std::filesystem::path(std::getenv("SHAD_AUTOMATION_USER_DIR"));
+        if (!user_dir.is_absolute() || !std::filesystem::is_directory(user_dir) ||
+            !std::filesystem::is_regular_file(user_dir / ".shadps4-test-user")) {
+            throw std::runtime_error("Automation requires an absolute, marked test user directory");
+        }
+        user_dir = std::filesystem::canonical(user_dir);
+    }
     if (!std::filesystem::exists(user_dir)) {
         // If it doesn't exist, use the standard path for the platform instead.
         // NOTE: On Windows we currently just create the portable directory instead.

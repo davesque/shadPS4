@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -10,6 +10,7 @@
 
 #include <SDL3/SDL.h>
 
+#include "common/automation.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
@@ -271,6 +272,21 @@ static bool is_first_check = true;
 
 void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
+    if (Common::IsAutomationMode() && !std::getenv("SHAD_AUTOMATION_PHYSICAL_PAD")) {
+        if (is_first_check) {
+            is_first_check = false;
+            auto* user = UserManagement.GetUserByPlayerIndex(1);
+            ASSERT_MSG(user, "Automation requires a player-one user");
+            controllers[0]->user_id = user->user_id;
+            controllers[0]->ConnectController(nullptr);
+            UserManagement.LoginUser(user, 1);
+            LOG_INFO(Config, "Automation save root forced to {}",
+                     EmulatorSettings.GetHomeDir().string());
+            LOG_INFO(Input,
+                     "Automation virtual controller connected; physical controllers disabled");
+        }
+        return;
+    }
     int controller_count;
     SDL_JoystickID* new_joysticks = SDL_GetGamepads(&controller_count);
     LOG_INFO(Input, "{} controllers are currently connected", controller_count);

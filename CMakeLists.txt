@@ -1263,7 +1263,10 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/big_picture/imgui_impl_sdlrenderer3.h
 )
 
-set(INPUT src/input/controller.cpp
+set(INPUT src/input/automation.cpp
+          src/input/automation.h
+          src/common/automation.h
+          src/input/controller.cpp
           src/input/controller.h
           src/input/controller_state.cpp
           src/input/controller_tuning.cpp

@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/automation.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
@@ -14,6 +16,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <fstream>
+#include <mutex>
 #include <optional>
 
 namespace Libraries::Pad {
@@ -441,7 +446,44 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     auto& controller = *it->second;
     std::array<Input::State, ORBIS_PAD_MAX_DATA_NUM> states;
     const int ret_num = controller.ReadStates(states.data(), num);
-    return ProcessStates(pData, states.data(), ret_num);
+    const int processed = ProcessStates(pData, states.data(), ret_num);
+    if (Common::IsAutomationMode() && processed > 0) {
+        static std::mutex trace_mutex;
+        const std::scoped_lock lock{trace_mutex};
+        static const auto start = std::chrono::steady_clock::now();
+        static auto last = start - std::chrono::seconds{1};
+        static std::ofstream trace{Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
+                                   "pad_reads.csv"};
+        static bool header = false;
+        const auto now = std::chrono::steady_clock::now();
+        static std::ofstream touches{Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
+                                     "touch_reads.csv"};
+        static bool touch_header = false;
+        if (!touch_header) {
+            touches << "elapsed,buttons,count,id,x,y,held\n";
+            touch_header = true;
+        }
+        touches << std::chrono::duration<double>(now - start).count() << ','
+                << static_cast<u32>(pData[0].buttons) << ',' << int(pData[0].touchData.touchNum)
+                << ',' << int(pData[0].touchData.touch[0].id) << ','
+                << pData[0].touchData.touch[0].x << ',' << pData[0].touchData.touch[0].y << ','
+                << pData[0].touchData.time_since_touch_held_down << '\n';
+        touches.flush();
+
+        if (now - last >= std::chrono::milliseconds{100}) {
+            last = now;
+            if (!header) {
+                trace << "elapsed,buffer,handle,lx,ly,rx,ry\n";
+                header = true;
+            }
+            trace << std::chrono::duration<double>(now - start).count() << ','
+                  << reinterpret_cast<uintptr_t>(pData) << ',' << handle << ','
+                  << int(pData[0].leftStick.x) << ',' << int(pData[0].leftStick.y) << ','
+                  << int(pData[0].rightStick.x) << ',' << int(pData[0].rightStick.y) << '\n';
+            trace.flush();
+        }
+    }
+    return processed;
 }
 
 int PS4_SYSV_ABI scePadReadBlasterForTracker() {
