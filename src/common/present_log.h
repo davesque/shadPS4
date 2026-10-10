@@ -49,6 +49,10 @@ enum class PresentStage : int {
 // True when SHAD_PRESENT_LOG is set. Cheap; use to skip building sub-timings.
 bool PresentLogEnabled();
 
+// True when the on-screen readout should be drawn: the present log is enabled
+// and SHAD_PRESENT_OVERLAY is not set to 0. Logging continues either way.
+bool PresentOverlayEnabled();
+
 // Last per-second summary values, for an on-screen readout that can be A/B'd
 // against an external overlay. `valid` is false until the first second elapses.
 struct PresentOnscreen {

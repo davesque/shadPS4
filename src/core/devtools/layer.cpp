@@ -428,9 +428,10 @@ void L::Draw() {
 
     // Always-visible telemetry readout (foreground draw list -> can't be parked
     // off-screen like the "Video Info" window). Gated by SHAD_PRESENT_LOG so it
-    // only appears during a diagnostic session. Lets the user A/B our measured
-    // present rate against an external overlay (e.g. Nvidia) on the same screen.
-    if (Common::PresentLogEnabled()) {
+    // only appears during a diagnostic session, and hidden by SHAD_PRESENT_OVERLAY=0.
+    // Lets the user A/B our measured present rate against an external overlay
+    // (e.g. Nvidia) on the same screen.
+    if (Common::PresentOverlayEnabled()) {
         const auto o = Common::PresentGetOnscreen();
         auto* dl = ImGui::GetForegroundDrawList();
         const ImVec2 pos{10.0f, 40.0f};

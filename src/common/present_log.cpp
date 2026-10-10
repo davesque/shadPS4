@@ -101,6 +101,14 @@ bool PresentLogEnabled() {
     return PresentFile() != nullptr;
 }
 
+bool PresentOverlayEnabled() {
+    static const bool hidden = []() {
+        const char* v = std::getenv("SHAD_PRESENT_OVERLAY");
+        return v != nullptr && v[0] == '0';
+    }();
+    return !hidden && PresentLogEnabled();
+}
+
 PresentOnscreen PresentGetOnscreen() {
     return g_onscreen;
 }
