@@ -349,7 +349,7 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
     {"unmapped", SDL_UNMAPPED},
 };
 
-void ParseInputConfig(const std::string game_id);
+bool ParseInputConfig(const std::string game_id, bool explicit_profile = false);
 
 class InputBinding {
 public:
@@ -451,13 +451,13 @@ public:
 
     u32 button;
     u32 axis;
-    u8 gamepad_id;
+    u8 gamepad_id{};
     // these are only used as s8,
     // but I added some padding to avoid overflow if it's activated by multiple inputs
     // axis_plus and axis_minus pairs share a common new_param, the other outputs have their own
-    s16 old_param;
+    s16 old_param{};
     s16* new_param;
-    bool old_button_state, new_button_state, state_changed, positive_axis;
+    bool old_button_state{}, new_button_state{}, state_changed{}, positive_axis{true};
 
     ControllerOutput(const u32 b, u32 a = SDL_GAMEPAD_AXIS_INVALID, bool p = true) {
         button = b;
@@ -467,8 +467,24 @@ public:
         positive_axis = p;
         gamepad_id = 0;
     }
-    ControllerOutput(const ControllerOutput& o) : button(o.button), axis(o.axis) {
-        new_param = new s16(*o.new_param);
+    ControllerOutput(const ControllerOutput& o)
+        : button(o.button), axis(o.axis), gamepad_id(o.gamepad_id), old_param(o.old_param),
+          new_param(new s16(*o.new_param)), old_button_state(o.old_button_state),
+          new_button_state(o.new_button_state), state_changed(o.state_changed),
+          positive_axis(o.positive_axis) {}
+    ControllerOutput& operator=(const ControllerOutput& o) {
+        if (this != &o) {
+            button = o.button;
+            axis = o.axis;
+            gamepad_id = o.gamepad_id;
+            old_param = o.old_param;
+            *new_param = *o.new_param;
+            old_button_state = o.old_button_state;
+            new_button_state = o.new_button_state;
+            state_changed = o.state_changed;
+            positive_axis = o.positive_axis;
+        }
+        return *this;
     }
     ~ControllerOutput() {
         delete new_param;
@@ -490,8 +506,8 @@ public:
     }
 
     void ResetUpdate();
-    void AddUpdate(InputEvent event);
-    void FinalizeUpdate(u8 gamepad_index);
+    void AddUpdate(InputEvent event, bool reconcile = false);
+    void FinalizeUpdate(u8 gamepad_index, bool reconcile = false);
 };
 class BindingConnection {
 public:
@@ -609,6 +625,6 @@ public:
 // Returns whether the list was updated or not.
 bool UpdatePressedKeys(InputEvent event);
 
-void ActivateOutputsFromInputs();
+void ActivateOutputsFromInputs(bool reconcile = false);
 
 } // namespace Input

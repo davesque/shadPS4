@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <iostream>
+
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_init.h>
@@ -299,9 +301,21 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_TOGGLE_FRIENDS:
         ImGui::Friends::Toggle();
         break;
-    case SDL_EVENT_RELOAD_INPUTS:
-        Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
+    case SDL_EVENT_RELOAD_INPUTS: {
+        const bool explicit_profile = event.user.code == 1;
+        const std::string profile = explicit_profile
+                                        ? static_cast<const char*>(event.user.data1)
+                                        : std::string(Common::ElfInfo::Instance().GameSerial());
+        if (explicit_profile) {
+            SDL_free(event.user.data1);
+        }
+        const bool loaded = Input::ParseInputConfig(profile, explicit_profile);
+        if (explicit_profile) {
+            std::cerr << (loaded ? ";INPUTS_RELOADED " : ";INPUTS_RELOAD_FAILED ") << profile
+                      << std::endl;
+        }
         break;
+    }
     case SDL_EVENT_MOUSE_TO_JOYSTICK:
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Joystick));
@@ -428,7 +442,9 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
     // the touchpad button shouldn't be rebound to anything else,
     // as it would break the entire touchpad handling
     // You can still bind other things to it though
-    if (event->gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+    if ((event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+         event->type == SDL_EVENT_GAMEPAD_BUTTON_UP) &&
+        event->gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
         controllers[controllers.GetGamepadIndexFromJoystickId(event->gbutton.which)]->Button(
             OrbisPadButtonDataOffset::TouchPad, input_down);
         return;

@@ -410,17 +410,22 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].touchData.touchNum =
             (states[i].touchpad[0].state ? 1 : 0) + (states[i].touchpad[1].state ? 1 : 0);
 
+        // A slot without a finger reports ID 0. Games such as Bloodborne tell a new touch from the
+        // previous one by its ID, so a stale ID makes them attribute a click to the old position.
+        const auto touch_id = [](const Input::TouchpadEntry& touch) -> u8 {
+            return touch.state ? touch.ID : 0;
+        };
         if (!states[i].touchpad[0].state && states[i].touchpad[1].state) {
             pData[i].touchData.touch[0].x = states[i].touchpad[1].x;
             pData[i].touchData.touch[0].y = states[i].touchpad[1].y;
-            pData[i].touchData.touch[0].id = states[i].touchpad[1].ID;
+            pData[i].touchData.touch[0].id = touch_id(states[i].touchpad[1]);
         } else {
             pData[i].touchData.touch[0].x = states[i].touchpad[0].x;
             pData[i].touchData.touch[0].y = states[i].touchpad[0].y;
-            pData[i].touchData.touch[0].id = states[i].touchpad[0].ID;
+            pData[i].touchData.touch[0].id = touch_id(states[i].touchpad[0]);
             pData[i].touchData.touch[1].x = states[i].touchpad[1].x;
             pData[i].touchData.touch[1].y = states[i].touchpad[1].y;
-            pData[i].touchData.touch[1].id = states[i].touchpad[1].ID;
+            pData[i].touchData.touch[1].id = touch_id(states[i].touchpad[1]);
         }
         if (Common::ElfInfo::Instance().FirmwareVer() > Common::ElfInfo::FW_350) {
             pData[i].touchData.time_since_touch_held_down = states[i].touch_time_since_held_down;

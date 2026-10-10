@@ -104,6 +104,8 @@ public:
     void PollLightColour();
     bool SetVibration(u8 smallMotor, u8 largeMotor);
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
+    void SyntheticTouchpadButton(bool pressed, float x);
+    void ResetSyntheticTouchpad();
 
     float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
     s32 user_id = Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID;
@@ -113,6 +115,12 @@ private:
     // m_state_mutex must be held by the caller.
     void PushStateLocked(u64 timestamp = 0);
     void UpdateOrientationLocked(u64 timestamp);
+
+    void SetTouchLocked(int touch_index, bool touch_down, float x, float y, u64 timestamp,
+                        bool new_touch);
+
+    // Mapped touchpad_left, touchpad_center and touchpad_right buttons that are currently held.
+    std::array<bool, 3> m_synthetic_buttons{};
 
     u8 m_next_touch_id{1};
     u64 m_touch_down_timestamp{};
