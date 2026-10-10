@@ -81,6 +81,10 @@ inline int GetAxis(int min, int max, int value) {
     return (v < 0 ? 0 : (v > 255 ? 255 : v));
 }
 
+// True when the user directory contains input_trace.on. Enables Info-level tracing of gamepad
+// events, synthetic touchpad clicks and the touch data returned to the game.
+bool IsInputTraceEnabled();
+
 class GameController {
     friend class GameControllers;
 

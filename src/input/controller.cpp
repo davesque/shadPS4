@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <unordered_set>
 #include <utility>
@@ -11,6 +12,7 @@
 #include <SDL3/SDL.h>
 
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/system/userservice.h"
@@ -57,6 +59,18 @@ void CalculateOrientation(const Libraries::Pad::OrbisFVector3& angular_velocity,
 }
 
 } // namespace
+
+bool IsInputTraceEnabled() {
+    static const bool enabled = [] {
+        const bool found = std::filesystem::exists(
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "input_trace.on");
+        if (found) {
+            LOG_INFO(Input, "Input tracing enabled by input_trace.on");
+        }
+        return found;
+    }();
+    return enabled;
+}
 
 GameController::GameController() : m_states_queue(64) {}
 
@@ -136,6 +150,11 @@ void GameController::SyntheticTouchpadButton(bool pressed, float x) {
         return;
     }
     m_synthetic_buttons[index] = pressed;
+    if (IsInputTraceEnabled()) {
+        LOG_INFO(Input, "Trace synthetic touchpad: slot={} pressed={} native0=({}, id {}, x {})",
+                 index, pressed, m_state.touchpad[0].state, m_state.touchpad[0].ID,
+                 m_state.touchpad[0].x);
+    }
     if (!pressed && std::ranges::any_of(m_synthetic_buttons, [](bool held) { return held; })) {
         // Another mapped touchpad button still holds the shared click.
         return;

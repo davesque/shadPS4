@@ -407,6 +407,22 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
                       event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
     Input::InputEvent input_event = Input::InputBinding::GetInputEventFromSDLEvent(*event);
 
+    if (Input::IsInputTraceEnabled()) {
+        if (event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+            event->type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+            LOG_INFO(Input, "Trace SDL button: {} {} (joystick {})",
+                     SDL_GetGamepadStringForButton(
+                         static_cast<SDL_GamepadButton>(event->gbutton.button)),
+                     input_down ? "down" : "up", event->gbutton.which);
+        } else if (event->type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN ||
+                   event->type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP) {
+            LOG_INFO(Input, "Trace SDL touch: finger {} {} at ({:.3f}, {:.3f}) (joystick {})",
+                     event->gtouchpad.finger,
+                     event->type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN ? "down" : "up",
+                     event->gtouchpad.x, event->gtouchpad.y, event->gtouchpad.which);
+        }
+    }
+
     // the touchpad button shouldn't be rebound to anything else,
     // as it would break the entire touchpad handling
     // You can still bind other things to it though

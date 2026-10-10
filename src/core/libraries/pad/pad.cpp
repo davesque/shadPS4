@@ -14,7 +14,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <mutex>
 #include <optional>
+#include <ranges>
 
 namespace Libraries::Pad {
 
@@ -446,7 +449,49 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     auto& controller = *it->second;
     std::array<Input::State, ORBIS_PAD_MAX_DATA_NUM> states;
     const int ret_num = controller.ReadStates(states.data(), num);
-    return ProcessStates(pData, states.data(), ret_num);
+    const int processed = ProcessStates(pData, states.data(), ret_num);
+    if (Input::IsInputTraceEnabled() && processed > 0) {
+        // Logs each state whose menu buttons or touch data differ from the previous one.
+        static std::mutex input_trace_mutex;
+        const std::scoped_lock lock{input_trace_mutex};
+        static u64 last_key = ~0ULL;
+        static std::array<int, 4> last_sticks{-100, -100, -100, -100};
+        static auto last_stick_log = std::chrono::steady_clock::time_point{};
+        for (int i = 0; i < processed; ++i) {
+            const auto& data = pData[i];
+            // Logs stick bytes when any axis moved at least 4 counts, at most ten times a second.
+            const std::array<int, 4> sticks{data.leftStick.x, data.leftStick.y, data.rightStick.x,
+                                            data.rightStick.y};
+            const auto stick_now = std::chrono::steady_clock::now();
+            const bool sticks_moved = std::ranges::any_of(std::views::iota(0, 4), [&](int axis) {
+                return std::abs(sticks[axis] - last_sticks[axis]) >= 4;
+            });
+            if (sticks_moved && stick_now - last_stick_log >= std::chrono::milliseconds{100}) {
+                last_sticks = sticks;
+                last_stick_log = stick_now;
+                LOG_INFO(Input, "Trace sticks: left=({}, {}) right=({}, {})", sticks[0], sticks[1],
+                         sticks[2], sticks[3]);
+            }
+            const auto& touch = data.touchData;
+            const u64 key = (static_cast<u64>(static_cast<u32>(data.buttons) & 0x100009) << 40) |
+                            (static_cast<u64>(touch.touchNum) << 36) |
+                            (static_cast<u64>(touch.touch[0].id) << 28) |
+                            (static_cast<u64>(touch.touch[1].id) << 20) |
+                            (static_cast<u64>(touch.touch[0].x >> 5) << 10) |
+                            static_cast<u64>(touch.touch[1].x >> 5);
+            if (key == last_key) {
+                continue;
+            }
+            last_key = key;
+            LOG_INFO(Input,
+                     "Trace pad read: num={} state={}/{} buttons={:#x} touchNum={} "
+                     "t0=(id {}, {}, {}) t1=(id {}, {}, {})",
+                     num, i + 1, processed, static_cast<u32>(data.buttons), touch.touchNum,
+                     touch.touch[0].id, touch.touch[0].x, touch.touch[0].y, touch.touch[1].id,
+                     touch.touch[1].x, touch.touch[1].y);
+        }
+    }
+    return processed;
 }
 
 int PS4_SYSV_ABI scePadReadBlasterForTracker() {
