@@ -427,8 +427,8 @@ void L::Draw() {
     }
 
     // Always-visible telemetry readout (foreground draw list -> can't be parked
-    // off-screen like the "Video Info" window). Gated by SHAD_PRESENT_LOG so it
-    // only appears during a diagnostic session, and hidden by SHAD_PRESENT_OVERLAY=0.
+    // off-screen like the "Video Info" window). Shown only when SHAD_PRESENT_LOG is
+    // set and SHAD_PRESENT_OVERLAY=1 asks for it, so it never appears by default.
     // Lets the user A/B our measured present rate against an external overlay
     // (e.g. Nvidia) on the same screen.
     if (Common::PresentOverlayEnabled()) {

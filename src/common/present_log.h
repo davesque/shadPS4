@@ -50,7 +50,7 @@ enum class PresentStage : int {
 bool PresentLogEnabled();
 
 // True when the on-screen readout should be drawn: the present log is enabled
-// and SHAD_PRESENT_OVERLAY is not set to 0. Logging continues either way.
+// and SHAD_PRESENT_OVERLAY=1 is set. The overlay is off by default.
 bool PresentOverlayEnabled();
 
 // Last per-second summary values, for an on-screen readout that can be A/B'd

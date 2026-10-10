@@ -102,11 +102,11 @@ bool PresentLogEnabled() {
 }
 
 bool PresentOverlayEnabled() {
-    static const bool hidden = []() {
+    static const bool requested = []() {
         const char* v = std::getenv("SHAD_PRESENT_OVERLAY");
-        return v != nullptr && v[0] == '0';
+        return v != nullptr && v[0] == '1';
     }();
-    return !hidden && PresentLogEnabled();
+    return requested && PresentLogEnabled();
 }
 
 PresentOnscreen PresentGetOnscreen() {
