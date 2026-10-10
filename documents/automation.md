@@ -25,7 +25,8 @@ Times are seconds since the input loop starts. Supported commands are `press`,
 `lefty`, `rightx`, `righty`, `l2`, and `r2`. Stick axes use byte values from 0 to
 255, with 128 centered. Scripted input bypasses response shaping and smoothing.
 
-Automation uses a virtual controller and does not open physical gamepads. The
+Automation uses a virtual controller and does not open physical gamepads unless
+`SHAD_AUTOMATION_PHYSICAL_PAD` is set. The
 window remains offscreen and windowed. Screenshots are captured every five
 seconds in the test user's `screenshots` directory. Vulkan rendering still uses
 the GPU; concurrent game sessions can affect performance measurements.

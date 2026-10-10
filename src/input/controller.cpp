@@ -272,7 +272,7 @@ static bool is_first_check = true;
 
 void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
-    if (Common::IsAutomationMode()) {
+    if (Common::IsAutomationMode() && !std::getenv("SHAD_AUTOMATION_PHYSICAL_PAD")) {
         if (is_first_check) {
             is_first_check = false;
             auto* user = UserManagement.GetUserByPlayerIndex(1);
