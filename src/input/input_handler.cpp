@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "input/controller_tuning.h"
 #include "input_handler.h"
 
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <list>
@@ -851,6 +853,13 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         case Axis::RightY:
             ApplyDeadzone(new_param, rightjoystick_deadzone[gamepad_index]);
             multiplier = rightjoystick_halfmode ? 0.5 : 1.0;
+            static CameraTuning camera_tuning{
+                [] {
+                    const char* path = std::getenv("SHAD_CAM_TUNE_FILE");
+                    return path ? std::filesystem::path{path} : std::filesystem::path{};
+                }(),
+                [](std::string_view message) { LOG_INFO(Input, "{}", message); }};
+            *new_param = camera_tuning.Apply(*new_param);
             break;
         case Axis::TriggerLeft:
             ApplyDeadzone(new_param, lefttrigger_deadzone[gamepad_index]);
